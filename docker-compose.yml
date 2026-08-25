@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  locali-e2e-platform:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: locali-e2e-platform
+    ports:
+      - "18080:8080"
+    environment:
+      - PORT=8080
+      - BASE_URL=${BASE_URL:-}
+      - NATS_URL=${NATS_URL:-nats://localhost:4222}
+      - ADMIN_LOGIN=${ADMIN_LOGIN:-}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      - CLIENT_TOKEN=${CLIENT_TOKEN:-}
+      - REST_TOKEN=${REST_TOKEN:-}
+      - COURIER_TOKEN=${COURIER_TOKEN:-}
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+      - VERIFICATION_CODE=${VERIFICATION_CODE:-1234}
+      - DATA_DIR=/app/data
+    volumes:
+      - e2e-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  e2e-data:
