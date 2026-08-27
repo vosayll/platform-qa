@@ -23,6 +23,11 @@ type Config struct {
 	VerificationCode string
 	// DataDir is the working directory for persisted artifacts (user scenarios etc.)
 	DataDir string
+
+	// TelegramBotToken / TelegramChatID enable failure alerts via the
+	// Telegram Bot API. Both empty (default) keeps alerting disabled.
+	TelegramBotToken string `json:"-"`
+	TelegramChatID   string `json:"-"`
 }
 
 // LoadFromEnv loads configuration with sensible defaults and environment overrides
@@ -49,8 +54,11 @@ func LoadFromEnv() *Config {
 		RequestTimeout: time.Duration(timeoutSec) * time.Second,
 		PollInterval:   500 * time.Millisecond,
 
-		VerificationCode: getEnv("VERIFICATION_CODE", "1234"),
+		VerificationCode: os.Getenv("VERIFICATION_CODE"),
 		DataDir:          getEnv("DATA_DIR", "./data"),
+
+		TelegramBotToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
+		TelegramChatID:   os.Getenv("TELEGRAM_CHAT_ID"),
 	}
 }
 

@@ -194,9 +194,9 @@
           <span>Быстрые действия</span>
         </h2>
         <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          <button onclick="runAllTests(this)" title="Запустить все сюты из реестра подряд"
-            class="qa-btn bg-green-600 hover:bg-green-500 text-white shadow-lg shadow-green-600/20 disabled:opacity-50">
-            <i class="fa-solid fa-play"></i><span>Запустить все тесты</span>
+          <button onclick="openRegressionModal()" title="Полный регресс: все сюты на выбранном стенде со сводкой в Telegram"
+            class="qa-btn bg-gradient-to-r from-fuchsia-600 to-purple-600 hover:from-fuchsia-500 hover:to-purple-500 text-white shadow-lg shadow-fuchsia-600/25 disabled:opacity-50">
+            <i class="fa-solid fa-rocket"></i><span>Регресс после релиза</span>
           </button>
           <button onclick="goToChecklists()" title="Перейти к сетке тестов и чеклистов"
             class="qa-btn bg-slate-800 hover:bg-slate-700 text-slate-100 border border-darkborder">
@@ -220,6 +220,8 @@
             <i class="fa-solid fa-arrows-rotate mr-1"></i>Обновить
           </button>
         </div>
+        <!-- Агрегированная плашка группы регресса (рендерит app.js) -->
+        <div id="regressionBannerBox" class="hidden px-4 pt-3"></div>
         <div id="recentRunsList"></div>
         <div id="recentRunsEmpty" class="hidden">
           <div class="py-10 text-center space-y-3">
@@ -282,6 +284,11 @@
           <button id="runSelectedBtn" onclick="runSelectedSuites(this)" disabled class="px-4 py-1.5 text-xs bg-green-600 hover:bg-green-500 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-green-600 text-white font-semibold rounded-lg transition flex items-center justify-center space-x-2 shrink-0">
             <i class="fa-solid fa-play"></i>
             <span>Запустить выбранное</span>
+          </button>
+          <button onclick="openRegressionAll()" title="Выделить все сюты и открыть модалку регресса"
+            class="px-4 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-fuchsia-300 border border-fuchsia-500/30 font-semibold rounded-lg transition flex items-center justify-center space-x-2 shrink-0">
+            <i class="fa-solid fa-rocket"></i>
+            <span>Регресс всех</span>
           </button>
           <button onclick="resetChecklist()" title="Сбросить локальные статусы чеков" class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 border border-darkborder rounded-lg transition shrink-0">
             <i class="fa-solid fa-rotate-right mr-1"></i> Сбросить статусы
@@ -671,6 +678,47 @@
     <!-- ================================================== -->
     <section id="view-tools" class="tab-view hidden space-y-6">
 
+      <!-- ======================= API SPEC IMPORT ======================= -->
+      <div class="bg-darkcard border border-darkborder rounded-xl p-6 space-y-5">
+        <div class="flex items-start justify-between gap-3 flex-wrap">
+          <div class="min-w-0">
+            <h2 class="text-lg font-bold text-white flex items-center space-x-2">
+              <i class="fa-solid fa-book-open text-emerald-400"></i>
+              <span>📖 Спецификация API</span>
+            </h2>
+            <p class="text-xs text-slate-400 mt-1">Импорт OpenAPI-спеки стенда: движок разберёт эндпоинты и создаст смоук-сценарии spec_smoke_* в реестре тестов.</p>
+          </div>
+          <!-- Строка состояния спеки: точка + описание + действия (рендерит js/spec.js) -->
+          <div id="specStatus" class="flex items-center gap-2.5 flex-wrap text-xs text-slate-400">
+            <span class="w-2 h-2 rounded-full bg-slate-600 shrink-0"></span>
+            <span>Спецификация не загружена</span>
+          </div>
+        </div>
+
+        <!-- Форма импорта -->
+        <div class="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+          <input type="url" id="specImportUrl" placeholder="https://r1.loca-li.com/api/openapi.json"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();document.getElementById('specImportBtn').click();}"
+            class="flex-1 min-w-0 bg-slate-900 border border-darkborder rounded-lg px-3 py-2 font-mono text-xs text-white placeholder-slate-600 focus:border-emerald-500/50 focus:outline-none">
+          <button id="specImportBtn" onclick="importSpec(this)" title="Загрузить спеку по URL и сгенерировать смоук-сценарии"
+            class="px-4 py-2 text-xs bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold rounded-lg transition flex items-center justify-center gap-2 shrink-0 shadow-lg shadow-emerald-600/20">
+            📥 Импортировать
+          </button>
+        </div>
+
+        <!-- Результат импорта (после успешного POST /api/spec/import) -->
+        <div id="specResultBox" class="hidden px-3.5 py-2.5 rounded-lg bg-green-500/10 border border-green-500/30 flex flex-wrap items-center gap-3">
+          <span id="specResultText" class="text-xs text-green-300 font-semibold flex-1 min-w-[200px] leading-relaxed"></span>
+          <button onclick="gotoChecklists()" title="Открыть реестр тестов со сгенерированными сценариями"
+            class="px-3 py-1.5 text-[11px] bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg transition shrink-0">
+            <i class="fa-solid fa-list-check mr-1"></i>Перейти к чеклистам
+          </button>
+        </div>
+
+        <!-- Ошибка импорта/сервера (текст от бэкенда при 400) -->
+        <div id="specErrorBox" class="hidden px-3.5 py-2.5 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-300 font-mono break-all whitespace-pre-wrap"></div>
+      </div>
+
       <!-- State Machine Visualizer -->
       <div class="bg-darkcard border border-darkborder rounded-xl p-6 space-y-6">
         <div>
@@ -973,7 +1021,10 @@
       </div>
 
       <div class="p-5 space-y-5 overflow-y-auto text-xs flex-1">
-        <p class="text-[11px] text-slate-500 leading-relaxed">У каждого стенда своё хранилище токенов — переключение стенда подменяет наборы токенов ролей.</p>
+        <div class="space-y-1">
+          <p class="text-[11px] text-slate-500 leading-relaxed">У каждого стенда своё хранилище токенов — переключение стенда подменяет наборы токенов ролей.</p>
+          <p class="text-[11px] text-slate-500 leading-relaxed"><i class="fa-solid fa-key mr-1 text-slate-600"></i>Код верификации клиента теперь вводится вручную во время прогона (модалка появится автоматически, когда код придёт в Telegram-группу)</p>
+        </div>
         <!-- Карточки стендов (рендерит stands.js) -->
         <div id="standsGrid" class="grid grid-cols-1 md:grid-cols-2 gap-3">
           <div class="md:col-span-2 py-6 text-center text-slate-500 italic">Загрузка...</div>
@@ -1006,17 +1057,6 @@
                 class="w-full bg-slate-900 border border-darkborder rounded-lg px-2.5 py-2 font-mono text-white placeholder-slate-600 focus:border-green-500/50 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60">
               <p id="standBaseUrlHint" class="hidden text-[10px] text-amber-400 mt-1"><i class="fa-solid fa-lock mr-1"></i>Мок-стенду нельзя менять Base URL</p>
             </div>
-            <div class="sm:col-span-2">
-              <label for="standVerifyCode" class="block font-semibold text-slate-300 mb-1">Verification Code</label>
-              <div class="relative">
-                <input type="password" id="standVerifyCode" placeholder="Код верификации этого стенда" autocomplete="off"
-                  class="w-full bg-slate-900 border border-darkborder rounded-lg px-2.5 py-2 pr-9 font-mono text-white placeholder-slate-600 focus:border-green-500/50 focus:outline-none">
-                <button onclick="toggleStandFormCodeVisibility()" title="Показать/скрыть код"
-                  class="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-200 transition">
-                  <i id="standVerifyCodeEyeIcon" class="fa-regular fa-eye"></i>
-                </button>
-              </div>
-            </div>
           </div>
 
           <div class="flex items-center justify-between gap-2 pt-1">
@@ -1027,6 +1067,34 @@
             </button>
           </div>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Input Verification Code Modal (появляется автоматически по SSE INPUT_REQUIRED) -->
+  <div id="inputCodeModal" class="fixed inset-0 bg-black/75 backdrop-blur-sm z-[90] hidden flex items-center justify-center p-4" onclick="if(event.target===this) closeInputCodeModal()">
+    <div class="bg-darkcard border border-darkborder rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl pop-in">
+      <div class="flex items-center justify-between border-b border-darkborder pb-3">
+        <h3 class="font-bold text-white text-base flex items-center space-x-2">
+          <i class="fa-solid fa-key text-yellow-400"></i>
+          <span>Код верификации</span>
+        </h3>
+        <button onclick="closeInputCodeModal()" title="Закрыть" class="text-slate-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
+      </div>
+
+      <p class="text-xs text-slate-300 leading-relaxed">Введите код, который пришёл в Telegram-группу для номера <b id="inputCodePhone" class="text-white font-bold break-all">—</b></p>
+
+      <div>
+        <input type="text" id="inputCodeValue" inputmode="numeric" maxlength="8" placeholder="123456" autocomplete="one-time-code"
+          oninput="this.value=this.value.replace(/\D/g,'')"
+          onkeydown="if(event.key==='Enter'){event.preventDefault();document.getElementById('inputCodeSubmitBtn').click();}"
+          class="w-full bg-slate-900 border border-darkborder rounded-lg px-3 py-2.5 text-center text-lg font-mono tracking-[0.4em] text-white placeholder-slate-600 focus:border-yellow-500/50 focus:outline-none">
+        <p class="text-[10px] text-slate-500 mt-2"><i class="fa-solid fa-hourglass-half mr-1 text-amber-400"></i>Прогон приостановлен и ждёт код (таймаут 3 минуты)</p>
+      </div>
+
+      <div class="flex justify-end space-x-2 pt-2 border-t border-darkborder">
+        <button onclick="cancelInputCode()" class="px-4 py-2 text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg">Отмена</button>
+        <button id="inputCodeSubmitBtn" onclick="submitInputCode(this)" class="px-4 py-2 text-xs bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white font-semibold rounded-lg transition">Отправить код</button>
       </div>
     </div>
   </div>
@@ -1144,9 +1212,77 @@
       </div>
       <div class="border-t border-darkborder px-5 py-3 shrink-0 flex items-center justify-between gap-3 bg-slate-900/60 rounded-b-2xl">
         <span id="runDetailsFooterMeta" class="text-[10px] font-mono text-slate-500 truncate">—</span>
-        <button onclick="openLogsForDetailsRun()" title="Открыть глобальные логи с фильтром по этому прогону"
-          class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-darkborder rounded-lg transition shrink-0">
-          <i class="fa-solid fa-scroll mr-1"></i>Все логи прогона
+        <div class="flex items-center gap-2 shrink-0 flex-wrap justify-end">
+          <button id="runExportJunitBtn" onclick="downloadReport(currentRunDetailsId,'junit')" title="Скачать отчёт прогона в формате JUnit XML"
+            class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-darkborder rounded-lg transition shrink-0">
+            ⬇ JUnit XML
+          </button>
+          <button id="runExportAllureBtn" onclick="downloadReport(currentRunDetailsId,'allure')" title="Скачать отчёт прогона как Allure-результаты (ZIP)"
+            class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-fuchsia-300 border border-darkborder rounded-lg transition shrink-0">
+            ⬇ Allure ZIP
+          </button>
+          <button onclick="openLogsForDetailsRun()" title="Открыть глобальные логи с фильтром по этому прогону"
+            class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-darkborder rounded-lg transition shrink-0">
+            <i class="fa-solid fa-scroll mr-1"></i>Все логи прогона
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Regression Modal («Регресс после релиза») -->
+  <!-- z-[45]: ниже standsModal (z-50), чтобы «управлять стендами» открывалось поверх,
+       и ниже confirmModal (z-[85]) для диалога о параллельных прогонах -->
+  <div id="regressionModal" class="fixed inset-0 bg-black/75 backdrop-blur-sm z-[45] hidden flex items-center justify-center p-4" onclick="if(event.target===this) closeRegressionModal()">
+    <div class="bg-darkcard border border-darkborder rounded-2xl max-w-lg w-full shadow-2xl max-h-[90vh] flex flex-col">
+      <div class="flex items-center justify-between border-b border-darkborder p-5 shrink-0">
+        <h3 class="font-bold text-white text-base flex items-center space-x-2">
+          <i class="fa-solid fa-rocket text-fuchsia-400"></i>
+          <span>Регресс после релиза</span>
+        </h3>
+        <button onclick="closeRegressionModal()" title="Закрыть" class="text-slate-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
+      </div>
+
+      <div class="p-5 space-y-5 overflow-y-auto text-xs flex-1">
+
+        <!-- Выбор стенда -->
+        <div class="space-y-2">
+          <div class="flex items-center justify-between gap-2">
+            <label class="block font-semibold text-slate-300">Стенд</label>
+            <a href="#" onclick="openStandsModal(); return false;" title="Открыть управление стендами"
+              class="text-[11px] font-semibold text-emerald-400 hover:text-emerald-300 underline decoration-dotted underline-offset-2 shrink-0">управлять стендами</a>
+          </div>
+          <div id="regStandsList" class="space-y-1.5" role="radiogroup" aria-label="Стенд для регресса">
+            <div class="py-3 text-center text-slate-500 italic">Загрузка стендов…</div>
+          </div>
+          <div id="regStandWarn" class="hidden px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 leading-relaxed">
+            <i class="fa-solid fa-triangle-exclamation mr-1"></i>Стенд будет активирован; токены загрузятся из его хранилища
+          </div>
+        </div>
+
+        <!-- Выбор сютов -->
+        <div class="space-y-2">
+          <div class="flex items-center justify-between gap-2">
+            <label class="block font-semibold text-slate-300">Сюты</label>
+            <span id="regSelCount" class="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-darkborder font-semibold shrink-0">Выбрано: 0</span>
+          </div>
+          <div id="regSuitesList" class="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+            <div class="sm:col-span-2 py-3 text-center text-slate-500 italic">Загрузка реестра сютов…</div>
+          </div>
+        </div>
+
+        <!-- Отчёт -->
+        <div class="px-3 py-2 rounded-lg bg-slate-900/60 border border-darkborder text-slate-300 flex items-center gap-2 leading-relaxed">
+          <i class="fa-brands fa-telegram text-sky-400 shrink-0"></i>
+          <span><b>Отчёт:</b> по завершении придёт сводка в Telegram (если настроен бот)</span>
+        </div>
+      </div>
+
+      <div class="border-t border-darkborder p-4 flex justify-end space-x-2 shrink-0 bg-slate-900/60 rounded-b-2xl">
+        <button onclick="closeRegressionModal()" class="px-4 py-2 text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg transition">Отмена</button>
+        <button id="regStartBtn" onclick="startRegression(this)" disabled
+          class="px-4 py-2 text-xs bg-gradient-to-r from-fuchsia-600 to-purple-600 hover:from-fuchsia-500 hover:to-purple-500 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:from-fuchsia-600 disabled:hover:to-purple-600 text-white font-semibold rounded-lg transition flex items-center gap-2 shadow-lg shadow-fuchsia-600/20">
+          <i class="fa-solid fa-rocket"></i><span>Запустить регресс</span>
         </button>
       </div>
     </div>
@@ -1235,6 +1371,7 @@
   <script src="js/logs.js"></script>
   <script src="js/scenarios-editor.js"></script>
   <script src="js/stands.js"></script>
+  <script src="js/spec.js"></script>
   <script src="app.js"></script>
   <script src="js/theme.js"></script>
 </body>

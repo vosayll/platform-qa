@@ -277,7 +277,9 @@ func substValue(v interface{}, vars map[string]string) interface{} {
 }
 
 // statusMatches validates the HTTP status against expectStatus:
-// empty => any status below 400; number => exact match; "Nxx" => class match.
+// empty => any status below 400; number => exact match; "Nxx" => class match;
+// "!Nxx" => success when the status is NOT in that class (e.g. "!5xx" treats
+// 401/403 as contract-compliant while any 5xx is a violation).
 func statusMatches(actual int, expect interface{}) bool {
 	if expect == nil {
 		return actual > 0 && actual < 400
@@ -289,12 +291,17 @@ func statusMatches(actual int, expect interface{}) bool {
 		return actual == t
 	case string:
 		class := strings.TrimSpace(t)
+		negated := strings.HasPrefix(class, "!")
+		if negated {
+			class = strings.TrimSpace(class[1:])
+		}
 		if len(class) == 3 && class[1:] == "xx" {
 			want, err := strconv.Atoi(string(class[0]))
-			if err != nil {
+			if err != nil || want < 1 || want > 9 {
 				return false
 			}
-			return actual/100 == want
+			inClass := actual >= want*100 && actual < (want+1)*100
+			return inClass != negated
 		}
 		return false
 	default:

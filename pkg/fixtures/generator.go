@@ -28,9 +28,35 @@ type FixtureManager struct {
 	cleanups   []func(ctx context.Context) error
 
 	verificationCode string
+	onInputRequest   func(runID, phone string)
 	presetClient     *presetIdentity
 	presetRest       *presetIdentity
 	presetCourier    *presetIdentity
+}
+
+// InputCtxKey is the context key under which the orchestrator exposes the
+// interactive verification-code requester for the duration of a run.
+type InputCtxKey struct{}
+
+// InputRequester pauses the run and asks the operator for the one-time code
+// delivered to the client's Telegram group.
+type InputRequester interface {
+	RequestVerificationCode(ctx context.Context, notify func(runID, phone string), phone string) (string, error)
+}
+
+func inputRequesterFromCtx(ctx context.Context) InputRequester {
+	if v, ok := ctx.Value(InputCtxKey{}).(InputRequester); ok && v != nil {
+		return v
+	}
+	return nil
+}
+
+// SetOnInputRequest installs the callback invoked right before the manager
+// starts waiting for an operator-entered code (the server wires it to UI events)
+func (fm *FixtureManager) SetOnInputRequest(fn func(runID, phone string)) {
+	fm.mu.Lock()
+	fm.onInputRequest = fn
+	fm.mu.Unlock()
 }
 
 // NewFixtureManager creates a new fixture manager
@@ -41,17 +67,16 @@ func NewFixtureManager(c *client.ClientAPI, r *client.RestAPI, cr *client.Courie
 		courierAPI:       cr,
 		adminAPI:         a,
 		cleanups:         make([]func(ctx context.Context) error, 0),
-		verificationCode: "1234",
+		verificationCode: "",
 	}
 }
 
-// SetVerificationCode injects the backend verification code from the engine config
+// SetVerificationCode injects the backend verification code from the engine config.
+// An empty value clears the universal code and enables the manual (operator) flow.
 func (fm *FixtureManager) SetVerificationCode(code string) {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
-	if code != "" {
-		fm.verificationCode = code
-	}
+	fm.verificationCode = code
 }
 
 // SetPresetToken registers a ready-made token for a role (client|rest|courier).
@@ -100,6 +125,7 @@ func (fm *FixtureManager) CreateUniqueClient(ctx context.Context) (phone, token 
 	fm.mu.Lock()
 	preset := fm.presetClient
 	code := fm.verificationCode
+	requestInput := fm.onInputRequest
 	fm.mu.Unlock()
 
 	if preset != nil {
@@ -116,6 +142,27 @@ func (fm *FixtureManager) CreateUniqueClient(ctx context.Context) (phone, token 
 	}
 	if err := fm.clientAPI.Register(ctx, regReq); err != nil {
 		return "", "", fmt.Errorf("fixture create client register: %w", err)
+	}
+
+	// Manual mode: no universal code is configured (real stand, one-shot codes
+	// arrive in Telegram), so pause the run and ask the operator. When a code
+	// IS configured or no requester travels in ctx (go test / dsl path),
+	// behaviour stays exactly as before.
+	if code == "" {
+		if ref := inputRequesterFromCtx(ctx); ref != nil {
+			entered, ierr := ref.RequestVerificationCode(ctx, requestInput, phone)
+			if ierr != nil {
+				return "", "", fmt.Errorf("клиент %s: %w", phone, ierr)
+			}
+			if entered == "" {
+				return "", "", fmt.Errorf("клиент %s: получен пустой код верификации", phone)
+			}
+			code = entered
+		} else {
+			// Legacy fallback for paths without a run context (go test / dsl):
+			// the embedded mock accepts any non-empty code.
+			code = "1234"
+		}
 	}
 
 	loginReq := client.ClientLoginRequest{

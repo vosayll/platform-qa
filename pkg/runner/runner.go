@@ -3,12 +3,17 @@ package runner
 import (
 	"context"
 	"fmt"
+	"log"
+	"net/http"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"locali-e2e-engine/pkg/client"
 	"locali-e2e-engine/pkg/dsl"
+	"locali-e2e-engine/pkg/fixtures"
 	"locali-e2e-engine/pkg/registry"
 	"locali-e2e-engine/pkg/scenario"
 	"locali-e2e-engine/pkg/statemachine"
@@ -36,6 +41,14 @@ const (
 // MaxRecentEvents is the ring buffer capacity of recent execution events
 const MaxRecentEvents = 2000
 
+// Trigger values stored in TestRun.Trigger. Manual runs alert individually,
+// grouped triggers (regression/webhook) are reported with a single digest.
+const (
+	TriggerManual     = "manual"
+	TriggerRegression = "regression"
+	TriggerWebhook    = "webhook"
+)
+
 // ExecutionEvent is emitted during test execution to update the Admin UI in real-time
 type ExecutionEvent struct {
 	RunID        string                   `json:"runId"`
@@ -46,6 +59,7 @@ type ExecutionEvent struct {
 	Level        LogLevel                 `json:"level"`
 	Message      string                   `json:"message"`
 	CheckID      string                   `json:"checkId,omitempty"`
+	InputPhone   string                   `json:"inputPhone,omitempty"`
 	StepIndex    int                      `json:"stepIndex,omitempty"`
 	TotalSteps   int                      `json:"totalSteps,omitempty"`
 	CurrentState statemachine.OrderStatus `json:"currentState,omitempty"`
@@ -90,6 +104,14 @@ type TestRun struct {
 	FailedChecks int                      `json:"failedChecks"`
 	Results      map[string]CheckResult   `json:"results,omitempty"`
 
+	// Trigger marks how the run was started: manual, regression or webhook.
+	// Empty for runs recorded before the field existed (omitempty keeps old
+	// persisted history files readable).
+	Trigger string `json:"trigger,omitempty"`
+	// GroupID ties all runs of one regression/webhook batch together so the
+	// server can send a single digest per batch; empty for manual runs.
+	GroupID string `json:"groupId,omitempty"`
+
 	stepCursor int `json:"-"`
 }
 
@@ -107,8 +129,18 @@ type TestOrchestrator struct {
 	custom       CustomSource
 	activeRuns   map[string]*TestRun
 	history      []*TestRun
+	historyStore *historyStore
 	broadcaster  chan *ExecutionEvent
 	recentEvents []*ExecutionEvent
+
+	// InputBroker routes operator-entered verification codes from the HTTP API
+	// to fixtures paused mid-run on client login (see input.go).
+	InputBroker *InputBroker
+
+	// OnRunFinished, when set, is invoked with a snapshot of every finished
+	// run at the end of executeSuite. Observers must treat the run as
+	// read-only and return quickly.
+	OnRunFinished func(run *TestRun)
 }
 
 // NewTestOrchestrator creates a new test orchestrator
@@ -117,6 +149,7 @@ func NewTestOrchestrator(engine *dsl.Engine) *TestOrchestrator {
 		engine:      engine,
 		activeRuns:  make(map[string]*TestRun),
 		history:     make([]*TestRun, 0),
+		InputBroker: NewInputBroker(),
 		broadcaster: make(chan *ExecutionEvent, 2000),
 	}
 }
@@ -177,12 +210,42 @@ func (o *TestOrchestrator) Broadcaster() <-chan *ExecutionEvent {
 	return o.broadcaster
 }
 
-// GetHistory returns past test runs
+// LoadHistory restores persisted run history from <dir>/runs. It must be
+// called once at startup (before any run is executed). Corrupt files are
+// skipped; the restored history is sorted by StartTime, newest first.
+func (o *TestOrchestrator) LoadHistory(dir string) error {
+	hs, err := newHistoryStore(dir)
+	if err != nil {
+		return err
+	}
+	loaded := hs.Load(MaxStoredRuns)
+
+	o.mu.Lock()
+	o.historyStore = hs
+	o.history = append(o.history, loaded...)
+	sort.SliceStable(o.history, func(i, j int) bool {
+		return o.history[i].StartTime.After(o.history[j].StartTime)
+	})
+	if len(o.history) > MaxStoredRuns {
+		o.history = o.history[:MaxStoredRuns]
+	}
+	o.mu.Unlock()
+
+	log.Printf("[HISTORY] restored %d runs from %s", len(loaded), hs.dir)
+	return nil
+}
+
+// GetHistory returns past test runs. Event payloads are stripped to keep the
+// listing compact; the full record including events is available via GetRun.
 func (o *TestOrchestrator) GetHistory() []*TestRun {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	res := make([]*TestRun, len(o.history))
-	copy(res, o.history)
+	for i, run := range o.history {
+		cp := *run
+		cp.Events = nil
+		res[i] = &cp
+	}
 	return res
 }
 
@@ -265,6 +328,7 @@ func (o *TestOrchestrator) RunSuite(suiteKey string) (*TestRun, error) {
 	}
 
 	run := o.newRun(suiteKey)
+	run.Trigger = TriggerManual
 
 	o.mu.Lock()
 	o.activeRuns[run.ID] = run
@@ -277,13 +341,39 @@ func (o *TestOrchestrator) RunSuite(suiteKey string) (*TestRun, error) {
 
 // RunSuites creates a TestRun per valid key and executes them sequentially
 // in a single goroutine (the caller's), never hitting the backend in parallel.
+// Runs are tagged with the manual trigger.
 func (o *TestOrchestrator) RunSuites(keys []string) ([]*TestRun, error) {
+	return o.RunSuitesGroup(keys, TriggerManual, "")
+}
+
+// RunSuitesWithTrigger runs the keys as one trigger batch: every run gets the
+// same Trigger and a single freshly generated GroupID, so observers (Telegram
+// digest) can treat the whole batch as one unit.
+func (o *TestOrchestrator) RunSuitesWithTrigger(keys []string, trigger string) ([]*TestRun, error) {
+	return o.RunSuitesGroup(keys, trigger, "")
+}
+
+// RunSuitesGroup is the core behind RunSuites and RunSuitesWithTrigger: it
+// validates all keys up front, tags every run with trigger/groupID (generating
+// a fresh GroupID when none is given for a non-manual trigger) and executes
+// the runs sequentially in the caller's goroutine.
+func (o *TestOrchestrator) RunSuitesGroup(keys []string, trigger, groupID string) ([]*TestRun, error) {
+	if trigger == "" {
+		trigger = TriggerManual
+	}
+	if groupID == "" && trigger != TriggerManual {
+		groupID = uuid.New().String()
+	}
+
 	runs := make([]*TestRun, 0, len(keys))
 	for _, key := range keys {
 		if !o.isValidSuiteKey(key) {
 			return nil, fmt.Errorf("unknown suite key: %s", key)
 		}
-		runs = append(runs, o.newRun(key))
+		run := o.newRun(key)
+		run.Trigger = trigger
+		run.GroupID = groupID
+		runs = append(runs, run)
 	}
 
 	o.mu.Lock()
@@ -474,7 +564,7 @@ func (o *TestOrchestrator) skipIfPending(run *TestRun, suiteKey, checkID, reason
 }
 
 func (o *TestOrchestrator) executeSuite(run *TestRun, suiteKey string) {
-	ctx := context.Background()
+	ctx := context.WithValue(context.Background(), fixtures.InputCtxKey{}, &InputRef{Broker: o.InputBroker, RunID: run.ID})
 	start := time.Now()
 
 	var err error
@@ -545,7 +635,34 @@ func (o *TestOrchestrator) executeSuite(run *TestRun, suiteKey string) {
 	o.mu.Lock()
 	delete(o.activeRuns, run.ID)
 	o.history = append([]*TestRun{run}, o.history...)
+	if len(o.history) > MaxStoredRuns {
+		o.history = o.history[:MaxStoredRuns]
+	}
 	o.mu.Unlock()
+
+	go o.persistRun(run)
+
+	if cb := o.OnRunFinished; cb != nil {
+		cp := *run
+		cb(&cp)
+	}
+}
+
+// persistRun stores the finalized run on disk without blocking orchestration.
+// Losing the last runs on a crash is acceptable by design. The store keeps at
+// most MaxStoredRuns files, evicting the oldest by StartTime.
+func (o *TestOrchestrator) persistRun(run *TestRun) {
+	o.mu.RLock()
+	hs := o.historyStore
+	o.mu.RUnlock()
+	if hs == nil {
+		return
+	}
+	if err := hs.Save(run); err != nil {
+		log.Printf("[HISTORY] persist run %s: %v", run.ID, err)
+		return
+	}
+	hs.Prune(MaxStoredRuns)
 }
 
 func (o *TestOrchestrator) runFlowA(ctx context.Context, run *TestRun, suiteKey string) error {
@@ -1019,9 +1136,80 @@ func (o *TestOrchestrator) runNegativeSM(ctx context.Context, run *TestRun, suit
 	})
 	o.checkDone(run, suiteKey, "illegal_jump_new_delivered", true, "Переход NEW → DELIVERED корректно запрещён", jumpStart)
 
-	o.checkSkip(run, suiteKey, "illegal_jump_preparing_delivered", "не покрыто раннером")
-	o.checkSkip(run, suiteKey, "unauthorized_role_client", "не покрыто раннером")
-	o.checkSkip(run, suiteKey, "unauthorized_role_restaurant", "не покрыто раннером")
+	// 2. Illegal jump: PREPARING directly to DELIVERED
+	jumpPrepStart := time.Now()
+	o.checkStart(run, suiteKey, "illegal_jump_preparing_delivered")
+	err = o.engine.StateMachine.ValidateTransition(statemachine.OrderTypeRestaurant, statemachine.StatusPreparing, statemachine.StatusDelivered, statemachine.RoleCourier)
+	if err == nil {
+		msg := "expected error for illegal jump PREPARING -> DELIVERED"
+		o.checkDone(run, suiteKey, "illegal_jump_preparing_delivered", false, msg, jumpPrepStart)
+		return fmt.Errorf("%s", msg)
+	}
+	if !strings.Contains(err.Error(), "illegal state transition") {
+		msg := fmt.Sprintf("expected 'illegal state transition' violation for PREPARING -> DELIVERED, got: %v", err)
+		o.checkDone(run, suiteKey, "illegal_jump_preparing_delivered", false, msg, jumpPrepStart)
+		return fmt.Errorf("%s", msg)
+	}
+	o.Emit(&ExecutionEvent{
+		RunID:     run.ID,
+		SuiteName: suiteName,
+		SuiteKey:  suiteKey,
+		StepType:  "THEN",
+		Level:     LogSuccess,
+		Message:   "✓ Correctly blocked illegal transition: PREPARING -> DELIVERED",
+		Timestamp: time.Now(),
+	})
+	o.checkDone(run, suiteKey, "illegal_jump_preparing_delivered", true, "Переход PREPARING → DELIVERED корректно запрещён", jumpPrepStart)
+
+	// 3. Unauthorized role: CLIENT trying to mark order DELIVERED
+	clientRoleStart := time.Now()
+	o.checkStart(run, suiteKey, "unauthorized_role_client")
+	err = o.engine.StateMachine.ValidateTransition(statemachine.OrderTypeRestaurant, statemachine.StatusPickedUp, statemachine.StatusDelivered, statemachine.RoleClient)
+	if err == nil {
+		msg := "expected authorization error for role CLIENT on PICKED_UP -> DELIVERED"
+		o.checkDone(run, suiteKey, "unauthorized_role_client", false, msg, clientRoleStart)
+		return fmt.Errorf("%s", msg)
+	}
+	if !strings.Contains(err.Error(), "not authorized") {
+		msg := fmt.Sprintf("expected 'not authorized' violation for role CLIENT, got: %v", err)
+		o.checkDone(run, suiteKey, "unauthorized_role_client", false, msg, clientRoleStart)
+		return fmt.Errorf("%s", msg)
+	}
+	o.Emit(&ExecutionEvent{
+		RunID:     run.ID,
+		SuiteName: suiteName,
+		SuiteKey:  suiteKey,
+		StepType:  "THEN",
+		Level:     LogSuccess,
+		Message:   "✓ Correctly rejected unauthorized role: CLIENT cannot mark order DELIVERED",
+		Timestamp: time.Now(),
+	})
+	o.checkDone(run, suiteKey, "unauthorized_role_client", true, "Роль CLIENT корректно отклонена на переходе PICKED_UP → DELIVERED", clientRoleStart)
+
+	// 4. Unauthorized role: RESTAURANT trying to assign courier
+	restRoleStart := time.Now()
+	o.checkStart(run, suiteKey, "unauthorized_role_restaurant")
+	err = o.engine.StateMachine.ValidateTransition(statemachine.OrderTypeRestaurant, statemachine.StatusNew, statemachine.StatusCourierAssigned, statemachine.RoleRestaurant)
+	if err == nil {
+		msg := "expected authorization error for role RESTAURANT on NEW -> COURIER_ASSIGNED"
+		o.checkDone(run, suiteKey, "unauthorized_role_restaurant", false, msg, restRoleStart)
+		return fmt.Errorf("%s", msg)
+	}
+	if !strings.Contains(err.Error(), "not authorized") {
+		msg := fmt.Sprintf("expected 'not authorized' violation for role RESTAURANT, got: %v", err)
+		o.checkDone(run, suiteKey, "unauthorized_role_restaurant", false, msg, restRoleStart)
+		return fmt.Errorf("%s", msg)
+	}
+	o.Emit(&ExecutionEvent{
+		RunID:     run.ID,
+		SuiteName: suiteName,
+		SuiteKey:  suiteKey,
+		StepType:  "THEN",
+		Level:     LogSuccess,
+		Message:   "✓ Correctly rejected unauthorized role: RESTAURANT cannot assign courier",
+		Timestamp: time.Now(),
+	})
+	o.checkDone(run, suiteKey, "unauthorized_role_restaurant", true, "Роль RESTAURANT корректно отклонена на переходе NEW → COURIER_ASSIGNED", restRoleStart)
 
 	return nil
 }
@@ -1074,8 +1262,95 @@ func (o *TestOrchestrator) runCancellation(ctx context.Context, run *TestRun, su
 	})
 	o.checkDone(run, suiteKey, "cancel_at_new", true, "Заказ успешно отменён на статусе NEW", cancelStart)
 
-	o.checkSkip(run, suiteKey, "reject_during_cooking", "не покрыто раннером")
-	o.checkSkip(run, suiteKey, "terminal_protection", "не покрыто раннером")
+	// 2. Cancellation attempt during COOKING must be rejected with 403
+	cookCancelStart := time.Now()
+	o.checkStart(run, suiteKey, "reject_during_cooking")
+
+	_, cookClientToken, err := o.engine.Fixtures.CreateUniqueClient(ctx)
+	if err != nil {
+		msg := fmt.Sprintf("fixture client failed: %v", err)
+		o.checkDone(run, suiteKey, "reject_during_cooking", false, msg, cookCancelStart)
+		return fmt.Errorf("%s", msg)
+	}
+	o.engine.SessionMgr.SetClientSession("c_cancel_cooking", cookClientToken, "+79991234567", "Client")
+
+	restCookLogin, _, err := o.engine.Fixtures.CreateUniqueRestaurant(ctx)
+	if err != nil {
+		msg := fmt.Sprintf("fixture restaurant failed: %v", err)
+		o.checkDone(run, suiteKey, "reject_during_cooking", false, msg, cookCancelStart)
+		return fmt.Errorf("%s", msg)
+	}
+
+	cookingOrder, err := o.engine.ClientAPI.CreateRestaurantOrder(ctx, client.CreateRestaurantOrderRequest{
+		RestID:          restCookLogin,
+		DeliveryAddress: "Москва, Тверская 12",
+		PaymentType:     "card",
+	})
+	if err != nil {
+		msg := fmt.Sprintf("order creation for cooking-cancel scenario failed: %v", err)
+		o.checkDone(run, suiteKey, "reject_during_cooking", false, msg, cookCancelStart)
+		return fmt.Errorf("%s", msg)
+	}
+
+	if _, err = o.engine.RestAPI.ChangeOrderStatus(ctx, cookingOrder.OrderID, "cooking"); err != nil {
+		msg := fmt.Sprintf("failed to move order #%d into COOKING before cancellation attempt: %v", cookingOrder.OrderNumber, err)
+		o.checkDone(run, suiteKey, "reject_during_cooking", false, msg, cookCancelStart)
+		return fmt.Errorf("%s", msg)
+	}
+	_ = o.engine.StateMachine.ValidateTransition(statemachine.OrderTypeRestaurant, statemachine.StatusNew, statemachine.StatusPreparing, statemachine.RoleRestaurant)
+	o.engine.StateMachine.RecordTransition(cookingOrder.OrderID, statemachine.StatusPreparing)
+
+	err = o.engine.ClientAPI.CancelOrder(ctx, cookingOrder.OrderID, "Попытка отменить заказ во время готовки")
+	if err == nil {
+		msg := fmt.Sprintf("cancellation during COOKING was expected to be rejected with 403, but order #%d was cancelled", cookingOrder.OrderNumber)
+		o.checkDone(run, suiteKey, "reject_during_cooking", false, msg, cookCancelStart)
+		return fmt.Errorf("%s", msg)
+	}
+	if !strings.Contains(err.Error(), "403") {
+		msg := fmt.Sprintf("expected 403 on cancellation during COOKING, got: %v", err)
+		o.checkDone(run, suiteKey, "reject_during_cooking", false, msg, cookCancelStart)
+		return fmt.Errorf("%s", msg)
+	}
+
+	o.Emit(&ExecutionEvent{
+		RunID:        run.ID,
+		SuiteName:    suiteName,
+		SuiteKey:     suiteKey,
+		StepType:     "THEN",
+		Level:        LogSuccess,
+		Message:      fmt.Sprintf("✓ Correctly rejected client cancellation of order #%d while COOKING (403 Forbidden)", cookingOrder.OrderNumber),
+		CurrentState: statemachine.StatusPreparing,
+		OrderID:      cookingOrder.OrderID,
+		Timestamp:    time.Now(),
+	})
+	o.checkDone(run, suiteKey, "reject_during_cooking", true, "Отмена заказа в статусе PREPARING (cooking) отклонена с 403", cookCancelStart)
+
+	// 3. Terminal state protection: nothing may modify a DELIVERED order
+	terminalStart := time.Now()
+	o.checkStart(run, suiteKey, "terminal_protection")
+	termErr := o.engine.StateMachine.ValidateTransition(statemachine.OrderTypeRestaurant, statemachine.StatusDelivered, statemachine.StatusPreparing, statemachine.RoleRestaurant)
+	if termErr == nil {
+		msg := "modification of DELIVERED order was expected to be blocked as terminal state"
+		o.checkDone(run, suiteKey, "terminal_protection", false, msg, terminalStart)
+		return fmt.Errorf("%s", msg)
+	}
+	if !strings.Contains(termErr.Error(), "terminal state") {
+		msg := fmt.Sprintf("expected terminal-state violation for DELIVERED order, got: %v", termErr)
+		o.checkDone(run, suiteKey, "terminal_protection", false, msg, terminalStart)
+		return fmt.Errorf("%s", msg)
+	}
+
+	o.Emit(&ExecutionEvent{
+		RunID:        run.ID,
+		SuiteName:    suiteName,
+		SuiteKey:     suiteKey,
+		StepType:     "THEN",
+		Level:        LogSuccess,
+		Message:      fmt.Sprintf("✓ Correctly blocked modification of delivered order: %v", termErr),
+		CurrentState: statemachine.StatusDelivered,
+		Timestamp:    time.Now(),
+	})
+	o.checkDone(run, suiteKey, "terminal_protection", true, "Терминальный статус DELIVERED защищён: модификация запрещена", terminalStart)
 
 	return nil
 }
@@ -1133,7 +1408,47 @@ func (o *TestOrchestrator) runSecurityRBAC(ctx context.Context, run *TestRun, su
 	})
 	o.checkDone(run, suiteKey, "client_admin_403", true, "Токен клиента у Admin API получил 403", adminStart)
 
-	o.checkSkip(run, suiteKey, "courier_rest_403", "не покрыто раннером")
+	// 3. Courier token trying to access Restaurant Dish Management API
+	courierRestStart := time.Now()
+	o.checkStart(run, suiteKey, "courier_rest_403")
+	_, courierToken, err := o.engine.Fixtures.CreateUniqueCourier(ctx)
+	if err != nil {
+		msg := fmt.Sprintf("fixture courier failed: %v", err)
+		o.checkDone(run, suiteKey, "courier_rest_403", false, msg, courierRestStart)
+		return fmt.Errorf("%s", msg)
+	}
+
+	dishReq := client.CreateDishRequest{
+		Name:   "Пицца Несанкционированная",
+		Price:  990,
+		RestID: "rest_123",
+	}
+	resp, rerr := o.engine.HTTPClient.Request(ctx, "POST", "/api/rests/dishes", courierToken, dishReq, nil)
+	if rerr == nil {
+		code := 0
+		if resp != nil {
+			code = resp.StatusCode
+		}
+		msg := fmt.Sprintf("expected 403 when Courier calls Restaurant Dish API, but request succeeded (status %d)", code)
+		o.checkDone(run, suiteKey, "courier_rest_403", false, msg, courierRestStart)
+		return fmt.Errorf("%s", msg)
+	}
+	if resp != nil && resp.StatusCode != http.StatusForbidden {
+		msg := fmt.Sprintf("expected 403 when Courier calls Restaurant Dish API, got status %d", resp.StatusCode)
+		o.checkDone(run, suiteKey, "courier_rest_403", false, msg, courierRestStart)
+		return fmt.Errorf("%s", msg)
+	}
+
+	o.Emit(&ExecutionEvent{
+		RunID:     run.ID,
+		SuiteName: suiteName,
+		SuiteKey:  suiteKey,
+		StepType:  "THEN",
+		Level:     LogSuccess,
+		Message:   "✓ Correctly returned 403 Forbidden when Courier token attempts Restaurant dish management",
+		Timestamp: time.Now(),
+	})
+	o.checkDone(run, suiteKey, "courier_rest_403", true, "Токен курьера у Restaurant API (POST /api/rests/dishes) получил 403", courierRestStart)
 
 	return nil
 }
@@ -1193,7 +1508,93 @@ func (o *TestOrchestrator) runIdempotency(ctx context.Context, run *TestRun, sui
 	})
 	o.checkDone(run, suiteKey, "same_key_same_order", true, fmt.Sprintf("Повтор с тем же ключом вернул тот же OrderID (%s)", order1.OrderID), idemStart)
 
-	o.checkSkip(run, suiteKey, "concurrent_isolation", "не покрыто раннером")
+	// 2. Concurrent isolation: N parallel order creations, each with its own client token
+	concStart := time.Now()
+	o.checkStart(run, suiteKey, "concurrent_isolation")
+
+	const parallelCount = 10
+	var wg sync.WaitGroup
+	errs := make(chan error, parallelCount)
+	orderIDs := make(chan string, parallelCount)
+
+	for i := 0; i < parallelCount; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+
+			// Each parallel worker creates its own unique client session
+			clientPhone, cToken, werr := o.engine.Fixtures.CreateUniqueClient(ctx)
+			if werr != nil {
+				errs <- fmt.Errorf("worker %d: клиент не создан: %w", idx, werr)
+				return
+			}
+
+			// Independent HTTP call: token passed explicitly, not via SessionMgr
+			var orderResp client.OrderResponse
+			orderReq := client.CreateIndependentOrderRequest{
+				AddressA:    fmt.Sprintf("Точка А worker %d", idx),
+				AddressB:    fmt.Sprintf("Точка Б worker %d", idx),
+				PaymentType: "card",
+				Price:       float64(300 + idx*10),
+			}
+			if _, werr = o.engine.HTTPClient.Request(ctx, "POST", "/api/clients/independent-order", cToken, orderReq, &orderResp); werr != nil {
+				errs <- fmt.Errorf("worker %d (%s): заказ не создан: %w", idx, clientPhone, werr)
+				return
+			}
+
+			orderIDs <- orderResp.OrderID
+		}(i)
+	}
+
+	wg.Wait()
+	close(errs)
+	close(orderIDs)
+
+	failedWorkers := 0
+	firstWorkerErr := error(nil)
+	for werr := range errs {
+		failedWorkers++
+		if firstWorkerErr == nil {
+			firstWorkerErr = werr
+		}
+	}
+	if firstWorkerErr != nil {
+		msg := fmt.Sprintf("параллельное создание заказов упало (%d/%d воркеров), первая ошибка: %v", failedWorkers, parallelCount, firstWorkerErr)
+		o.checkDone(run, suiteKey, "concurrent_isolation", false, msg, concStart)
+		return fmt.Errorf("%s", msg)
+	}
+
+	uniqueIDs := make(map[string]bool, parallelCount)
+	totalOrders := 0
+	duplicateID := ""
+	for id := range orderIDs {
+		totalOrders++
+		if uniqueIDs[id] && duplicateID == "" {
+			duplicateID = id
+		}
+		uniqueIDs[id] = true
+	}
+	if duplicateID != "" {
+		msg := fmt.Sprintf("найден дубликат OrderID при конкурентном создании: %s", duplicateID)
+		o.checkDone(run, suiteKey, "concurrent_isolation", false, msg, concStart)
+		return fmt.Errorf("%s", msg)
+	}
+	if totalOrders != parallelCount || len(uniqueIDs) != parallelCount {
+		msg := fmt.Sprintf("ожидалось %d уникальных заказов, получено %d (уникальных: %d)", parallelCount, totalOrders, len(uniqueIDs))
+		o.checkDone(run, suiteKey, "concurrent_isolation", false, msg, concStart)
+		return fmt.Errorf("%s", msg)
+	}
+
+	o.Emit(&ExecutionEvent{
+		RunID:     run.ID,
+		SuiteName: suiteName,
+		SuiteKey:  suiteKey,
+		StepType:  "THEN",
+		Level:     LogSuccess,
+		Message:   fmt.Sprintf("✓ Successfully executed %d concurrent order flows: all OrderIDs unique, zero session crosstalk", parallelCount),
+		Timestamp: time.Now(),
+	})
+	o.checkDone(run, suiteKey, "concurrent_isolation", true, fmt.Sprintf("%d параллельных созданий вернули %d уникальных независимых OrderID без пересечений сессий", parallelCount, len(uniqueIDs)), concStart)
 
 	return nil
 }

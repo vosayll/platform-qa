@@ -11,14 +11,19 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/google/uuid"
 
 	"locali-e2e-engine/config"
 	"locali-e2e-engine/pkg/client"
 	"locali-e2e-engine/pkg/dsl"
 	"locali-e2e-engine/pkg/registry"
+	"locali-e2e-engine/pkg/report"
 	"locali-e2e-engine/pkg/runner"
 	"locali-e2e-engine/pkg/scenario"
 	"locali-e2e-engine/pkg/stands"
+	"locali-e2e-engine/pkg/spec"
 	"locali-e2e-engine/testserver"
 )
 
@@ -30,6 +35,7 @@ type Server struct {
 	mockBackend  *testserver.MockBackend
 	store        *scenario.Store
 	stands       *stands.Store
+	specs        *spec.Store
 	webDir       string
 
 	// Per-stand token vault state. lastStandID tracks the stand that owns the
@@ -39,6 +45,71 @@ type Server struct {
 	vaultDir    string
 	vaultMu     sync.Mutex
 	lastStandID string
+
+	// groups tracks in-flight grouped batches (regression/webhook): how many
+	// runs are still pending per GroupID and the finished run snapshots, so a
+	// single Telegram digest is sent when the whole group completes.
+	groups groupTracker
+}
+
+// groupTracker accumulates finished runs of grouped batches and fires exactly
+// once per GroupID — when its last pending run finishes. Registration happens
+// in handleRuns before execution starts; finish is called from the
+// OnRunFinished hook for every completed grouped run.
+type groupTracker struct {
+	mu      sync.Mutex
+	pending map[string]int
+	runs    map[string][]*runner.TestRun
+}
+
+// register reserves a fresh GroupID for an expected number of runs.
+func (t *groupTracker) register(expected int) string {
+	id := uuid.NewString()
+	t.mu.Lock()
+	if t.pending == nil {
+		t.pending = make(map[string]int)
+		t.runs = make(map[string][]*runner.TestRun)
+	}
+	t.pending[id] = expected
+	t.runs[id] = make([]*runner.TestRun, 0, expected)
+	t.mu.Unlock()
+	return id
+}
+
+// discard forgets a registered group whose runs never executed (e.g. invalid
+// suite keys rejected before any run started).
+func (t *groupTracker) discard(groupID string) {
+	t.mu.Lock()
+	delete(t.pending, groupID)
+	delete(t.runs, groupID)
+	t.mu.Unlock()
+}
+
+// finish records a completed run of its group and returns snapshots of the
+// entire group when it was the last pending one; nil otherwise. Unknown groups
+// (e.g. engine restarted mid-batch) yield no digest.
+func (t *groupTracker) finish(run *runner.TestRun) []*runner.TestRun {
+	if run == nil || run.GroupID == "" {
+		return nil
+	}
+	cp := *run
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	left, ok := t.pending[run.GroupID]
+	if !ok {
+		return nil
+	}
+	group := t.runs[run.GroupID]
+	group = append(group, &cp)
+	t.runs[run.GroupID] = group
+	left--
+	if left > 0 {
+		t.pending[run.GroupID] = left
+		return nil
+	}
+	delete(t.pending, run.GroupID)
+	delete(t.runs, run.GroupID)
+	return group
 }
 
 // NewServer initializes the platform server
@@ -63,12 +134,37 @@ func NewServer(cfg *config.Config, webDir string) (*Server, error) {
 
 	orchestrator := runner.NewTestOrchestrator(engine)
 
+	// Manual verification-code flow: on a real stand without a universal code,
+	// fixtures pause mid-run on client login awaiting the operator. The
+	// embedded mock accepts any code, so there the callback auto-satisfies the
+	// request instead of surfacing a prompt (mock batches must never stop).
+	engine.Fixtures.SetOnInputRequest(func(runID, phone string) {
+		if mock != nil {
+			orchestrator.InputBroker.Deliver(runID, "1234")
+			return
+		}
+		orchestrator.Emit(&runner.ExecutionEvent{
+			RunID:      runID,
+			SuiteName:  "Manual Input",
+			StepType:   "INPUT_REQUIRED",
+			Level:      runner.LogWarn,
+			Message:    fmt.Sprintf("Ожидание кода верификации для %s — введите код из Telegram", phone),
+			InputPhone: phone,
+			Timestamp:  time.Now(),
+		})
+	})
+
 	// User-defined scenarios storage (JSON files under <DataDir>/scenarios)
 	scenarioStore, err := scenario.NewStore(filepath.Join(cfg.DataDir, "scenarios"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to init scenario store: %w", err)
 	}
 	orchestrator.SetCustomSource(scenarioStore)
+
+	// Restore persisted run history from <DataDir>/runs (survives restarts).
+	if err := orchestrator.LoadHistory(cfg.DataDir); err != nil {
+		log.Printf("[SERVER] Run history restore skipped: %v", err)
+	}
 
 	// Multi-stand targets storage (<DataDir>/stands.json)
 	var defaultStand stands.Stand
@@ -82,6 +178,13 @@ func NewServer(cfg *config.Config, webDir string) (*Server, error) {
 		return nil, fmt.Errorf("failed to init stands store: %w", err)
 	}
 
+	// Imported OpenAPI/Swagger specification (<DataDir>/specs) and its
+	// generated smoke scenarios.
+	specStore, err := spec.NewStore(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to init spec store: %w", err)
+	}
+
 	srv := &Server{
 		cfg:          cfg,
 		engine:       engine,
@@ -89,6 +192,7 @@ func NewServer(cfg *config.Config, webDir string) (*Server, error) {
 		mockBackend:  mock,
 		store:        scenarioStore,
 		stands:       standsStore,
+		specs:        specStore,
 		webDir:       webDir,
 		vaultDir:     stands.VaultsDir(cfg.DataDir),
 	}
@@ -101,7 +205,40 @@ func NewServer(cfg *config.Config, webDir string) (*Server, error) {
 		srv.applyStand(act)
 	}
 
+	// Telegram notifications: manual runs alert individually on failure,
+	// grouped triggers (regression/webhook) produce exactly ONE combined
+	// digest when the last run of the group finishes. Fire-and-forget, never
+	// affects run results.
+	orchestrator.OnRunFinished = func(run *runner.TestRun) {
+		srv.notifyRunFinished(run)
+	}
+
 	return srv, nil
+}
+
+// notifyRunFinished decides between a single failure alert (manual or legacy
+// untagged runs) and the grouped digest path (regression/webhook): the group
+// tracker fires SendDigest once, after its last pending run completes.
+func (s *Server) notifyRunFinished(run *runner.TestRun) {
+	if run == nil {
+		return
+	}
+	switch run.Trigger {
+	case runner.TriggerRegression, runner.TriggerWebhook:
+		groupRuns := s.groups.finish(run)
+		if groupRuns == nil {
+			return
+		}
+		baseURL := s.cfg.BaseURL
+		go func() {
+			report.SendDigest(context.Background(), s.cfg, report.DigestText(groupRuns, baseURL))
+		}()
+	default: // manual / empty (legacy runs)
+		if run.Status != "FAILED" {
+			return
+		}
+		go report.NotifyFailure(context.Background(), s.cfg, run)
+	}
 }
 
 // Start starts listening on given port
@@ -127,6 +264,11 @@ func (s *Server) Start(port int) error {
 	mux.HandleFunc("/api/sessions/token", s.handleSetToken)
 	mux.HandleFunc("/api/suites", s.handleSuites)
 	mux.HandleFunc("/api/runs", s.handleRuns)
+	// Export routes must be registered with longer (more specific) patterns:
+	// ServeMux picks the most specific one over the "/api/runs/" prefix below.
+	mux.HandleFunc("/api/runs/{id}/export/junit", s.handleExportJUnit)
+	mux.HandleFunc("/api/runs/{id}/export/allure", s.handleExportAllure)
+	mux.HandleFunc("POST /api/runs/{id}/input-code", s.handleRunInputCode)
 	mux.HandleFunc("/api/runs/", s.handleRunByID)
 	mux.HandleFunc("/api/events", s.handleEventsSSE)
 	mux.HandleFunc("/api/events/recent", s.handleRecentEvents)
@@ -135,6 +277,11 @@ func (s *Server) Start(port int) error {
 	// User-defined custom scenarios
 	mux.HandleFunc("/api/scenarios", s.handleScenarios)
 	mux.HandleFunc("/api/scenarios/", s.handleScenarioByID)
+
+	// OpenAPI/Swagger import & generated smoke scenarios
+	mux.HandleFunc("/api/spec/import", s.handleSpecImport)
+	mux.HandleFunc("/api/spec/current", s.handleSpecCurrent)
+	mux.HandleFunc("/api/spec/regenerate", s.handleSpecRegenerate)
 
 	// Stand targets (multi-backend switching)
 	mux.HandleFunc("/api/stands", s.handleStands)
@@ -736,6 +883,142 @@ func (s *Server) handleScenarioByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleSpecImport serves POST /api/spec/import {"url"}: downloads an
+// OpenAPI/Swagger document, parses it, persists the pair and regenerates the
+// spec_smoke_* scenarios. Parse/download failures are reported as plain-text
+// 400 responses.
+func (s *Server) handleSpecImport(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid json body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	raw, err := spec.Fetch(r.Context(), req.URL)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	meta, err := spec.Parse(raw)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	meta.SourceURL = strings.TrimSpace(req.URL)
+
+	if err := s.specs.Save(meta, raw); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	generated, err := s.replaceGeneratedScenarios(meta)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"meta":      meta,
+		"generated": generated,
+	})
+}
+
+// handleSpecCurrent serves GET /api/spec/current (import summary) and
+// DELETE /api/spec/current (drop the specification and its scenarios).
+func (s *Server) handleSpecCurrent(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.Method {
+	case http.MethodGet:
+		meta, ok := s.specs.Meta()
+		if !ok {
+			http.Error(w, `{"error":"спецификация не импортирована"}`, http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(meta)
+
+	case http.MethodDelete:
+		removed := s.deleteGeneratedScenarios()
+		if err := s.specs.Delete(); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+		log.Printf("[SERVER] Spec removed, %d generated scenarios deleted", removed)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "removedScenarios": removed})
+
+	default:
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+	}
+}
+
+// handleSpecRegenerate serves POST /api/spec/regenerate — rebuilds the
+// spec_smoke_* scenarios from the stored import summary.
+func (s *Server) handleSpecRegenerate(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	meta, ok := s.specs.Meta()
+	if !ok {
+		http.Error(w, `{"error":"спецификация не импортирована"}`, http.StatusNotFound)
+		return
+	}
+
+	generated, err := s.replaceGeneratedScenarios(meta)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"meta":      meta,
+		"generated": generated,
+	})
+}
+
+// replaceGeneratedScenarios wipes every previously generated spec_smoke_*
+// scenario and persists fresh ones; returns the keys of the saved scenarios.
+func (s *Server) replaceGeneratedScenarios(meta *spec.Meta) ([]string, error) {
+	s.deleteGeneratedScenarios()
+
+	scenarios := spec.GenerateScenarios(meta)
+	keys := make([]string, 0, len(scenarios))
+	for _, sc := range scenarios {
+		if err := s.store.Save(sc); err != nil {
+			return keys, fmt.Errorf("сохранение сценария %s: %w", sc.Key, err)
+		}
+		keys = append(keys, sc.Key)
+	}
+	return keys, nil
+}
+
+// deleteGeneratedScenarios removes all scenarios owned by the spec importer.
+func (s *Server) deleteGeneratedScenarios() int {
+	removed := 0
+	for _, sc := range s.store.List() {
+		if !strings.HasPrefix(sc.Key, spec.GeneratedPrefix) {
+			continue
+		}
+		if err := s.store.Delete(sc.Key); err == nil {
+			removed++
+		}
+	}
+	return removed
+}
+
 func (s *Server) handleStands(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -932,13 +1215,28 @@ func (s *Server) seedEnvTokens() {
 func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
 		var req struct {
-			Suite  string   `json:"suite"`
-			Suites []string `json:"suites"`
+			Suite   string   `json:"suite"`
+			Suites  []string `json:"suites"`
+			Trigger string   `json:"trigger"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 
 		if len(req.Suites) > 0 {
-			runs, err := s.orchestrator.RunSuites(req.Suites)
+			var (
+				runs []*runner.TestRun
+				err  error
+			)
+			if trigger := normalizeTrigger(req.Trigger); trigger == runner.TriggerManual {
+				runs, err = s.orchestrator.RunSuites(req.Suites)
+			} else {
+				// Register the group before execution starts: runs execute
+				// synchronously, so every OnRunFinished fires inside the call.
+				groupID := s.groups.register(len(req.Suites))
+				runs, err = s.orchestrator.RunSuitesGroup(req.Suites, trigger, groupID)
+				if err != nil {
+					s.groups.discard(groupID)
+				}
+			}
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -968,6 +1266,45 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(s.orchestrator.GetHistory())
 }
 
+// normalizeTrigger whitelists grouped triggers; unknown or empty values fall
+// back to a plain manual run.
+func normalizeTrigger(raw string) string {
+	switch raw {
+	case runner.TriggerRegression, runner.TriggerWebhook:
+		return raw
+	default:
+		return runner.TriggerManual
+	}
+}
+
+// handleRunInputCode serves POST /api/runs/{id}/input-code — the operator
+// submits the Telegram verification code for a run paused on client login.
+func (s *Server) handleRunInputCode(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid json body"}`))
+		return
+	}
+	code := strings.TrimSpace(req.Code)
+	if code == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"поле code обязательно"}`))
+		return
+	}
+
+	if !s.orchestrator.InputBroker.Deliver(r.PathValue("id"), code) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"нет активного ожидания кода для этого прогона"}`))
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
 func (s *Server) handleRunByID(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/runs/")
 	run := s.orchestrator.GetRun(id)
@@ -977,6 +1314,68 @@ func (s *Server) handleRunByID(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(run)
+}
+
+// handleExportJUnit serves GET /api/runs/{id}/export/junit — the run as a
+// downloadable JUnit XML report.
+func (s *Server) handleExportJUnit(w http.ResponseWriter, r *http.Request) {
+	s.serveRunExport(w, r, "xml", "application/xml", func(run *runner.TestRun) ([]byte, error) {
+		return report.JUnitXML(run), nil
+	})
+}
+
+// handleExportAllure serves GET /api/runs/{id}/export/allure — the run as an
+// Allure results ZIP archive.
+func (s *Server) handleExportAllure(w http.ResponseWriter, r *http.Request) {
+	s.serveRunExport(w, r, "zip", "application/zip", report.AllureResultsZip)
+}
+
+func (s *Server) serveRunExport(w http.ResponseWriter, r *http.Request, ext, contentType string, render func(*runner.TestRun) ([]byte, error)) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	run := s.orchestrator.GetRun(r.PathValue("id"))
+	if run == nil {
+		http.NotFound(w, r)
+		return
+	}
+	data, err := render(run)
+	if err != nil {
+		log.Printf("[SERVER] export %s for run %s: %v", ext, run.ID, err)
+		http.Error(w, "export failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition",
+		fmt.Sprintf(`attachment; filename="run-%s-%s.%s"`, exportSuiteSlug(run), shortID(run.ID), ext))
+	_, _ = w.Write(data)
+}
+
+// exportSuiteSlug returns a filesystem-safe suite key for export file names.
+func exportSuiteSlug(run *runner.TestRun) string {
+	key := run.SuiteKey
+	if key == "" {
+		key = run.SuiteName
+	}
+	if key == "" {
+		key = "run"
+	}
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+			return r
+		default:
+			return '-'
+		}
+	}, key)
+}
+
+func shortID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
 }
 
 func (s *Server) handleEventsSSE(w http.ResponseWriter, r *http.Request) {

@@ -36,6 +36,13 @@ let tokenVault = null;
 // Дебаунс-таймер обновления после SUMMARY
 let summaryRefreshTimer = null;
 
+// Прогон, ожидающий ввод кода верификации (модалка inputCodeModal)
+let pendingInputRunId = null;
+
+// Группа батч-регресса (trigger=regression): groupId из ответа POST /api/runs.
+// Используется для агрегированной плашки «Регресс: ✅ N/M» на Обзоре.
+let activeRegressionGroupId = null;
+
 function getActiveRunsCount() {
   return activeRunsCount;
 }
@@ -76,6 +83,9 @@ function switchTab(tabId) {
   }
   if (tabId === 'scenarios') {
     loadScenarioEditor();
+  }
+  if (tabId === 'tools') {
+    if (typeof loadSpec === 'function') loadSpec(); // состояние «Спецификация API» (js/spec.js)
   }
 }
 
@@ -274,7 +284,13 @@ function handleExecutionEvent(event) {
     }
   }
 
-  // 4. Итог прогона: баннер на карточке + обновления разделов
+  // 4. Запрос кода верификации: бэкенд приостановил прогон и ждёт POST /api/runs/{runId}/input-code
+  if (event.stepType === 'INPUT_REQUIRED') {
+    openInputCodeModal(event.runId, event.inputPhone);
+    return;
+  }
+
+  // 5. Итог прогона: баннер на карточке + обновления разделов
   if (event.stepType === 'SUMMARY') {
     const ok = event.level === 'SUCCESS' || event.level === 'PASSED';
     finalizeSuiteCard(event.suiteKey, ok, event);
@@ -292,6 +308,89 @@ function schedulePostSummaryRefresh() {
     loadHistory().then(() => updateOverviewFromCache());
   }, 300);
 }
+
+// ==========================================
+// ВВОД КОДА ВЕРИФИКАЦИИ ВО ВРЕМЯ ПРОГОНА
+// Бэкенд по SSE присылает stepType=INPUT_REQUIRED с inputPhone,
+// приостанавливает прогон (до 3 минут) и ждёт
+// POST /api/runs/{runId}/input-code {"code":"..."} → 200 | 404.
+// ==========================================
+
+function openInputCodeModal(runId, phone) {
+  if (!runId) return;
+  const modal = document.getElementById('inputCodeModal');
+  if (!modal) return;
+
+  pendingInputRunId = runId;
+  const phoneEl = document.getElementById('inputCodePhone');
+  if (phoneEl) phoneEl.textContent = phone || '—';
+  const input = document.getElementById('inputCodeValue');
+  if (input) input.value = '';
+
+  modal.classList.remove('hidden');
+  logTerminal('WARN', 'Прогон ожидает код верификации для ' + (phone || 'номера') + '.');
+  setTimeout(() => { if (input) input.focus(); }, 50);
+}
+
+function closeInputCodeModal() {
+  const modal = document.getElementById('inputCodeModal');
+  if (modal) modal.classList.add('hidden');
+  pendingInputRunId = null;
+}
+
+// Отмена: закрываем модалку; прогон продолжит ждать и упадёт по таймауту (3 мин)
+async function cancelInputCode() {
+  const ok = await confirmDialog(
+    'Закрыть без ввода кода?',
+    'Прогон продолжит ждать код до таймаута (3 минуты), после чего завершится ошибкой.',
+    'Закрыть'
+  );
+  if (ok) closeInputCodeModal();
+}
+
+async function submitInputCode(btn) {
+  const input = document.getElementById('inputCodeValue');
+  const code = input ? input.value.trim() : '';
+  if (!code) {
+    toastError('Введите код из Telegram-группы.');
+    if (input) input.focus();
+    return;
+  }
+  const runId = pendingInputRunId;
+  if (!runId) {
+    toastError('Нет активного прогона, ожидающего код.');
+    return;
+  }
+
+  await busyWrap(btn, async () => {
+    try {
+      const res = await fetch('/api/runs/' + encodeURIComponent(runId) + '/input-code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code }),
+      });
+      if (res.ok) {
+        toastSuccess('Код принят — прогон продолжается');
+        logTerminal('INFO', 'Код верификации отправлен в прогон ' + String(runId).substring(0, 8) + '.');
+        closeInputCodeModal();
+      } else if (res.status === 404) {
+        toastError('Окно ожидания истекло');
+        closeInputCodeModal();
+      } else {
+        toastError('Ошибка отправки кода: HTTP ' + res.status + ' ' + (await res.text()));
+      }
+    } catch (err) {
+      toastError('Ошибка отправки кода: ' + err.message);
+    }
+  });
+}
+
+// Esc закрывает модалку ввода кода (паттерн существующих модалок)
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const modal = document.getElementById('inputCodeModal');
+  if (modal && !modal.classList.contains('hidden')) closeInputCodeModal();
+});
 
 // Системные сообщения UI попадают в тот же глобальный журнал
 function logTerminal(level, msg) {
@@ -856,6 +955,7 @@ async function refreshOverview() {
 function updateOverviewFromCache() {
   updateOverviewPassRate();
   updateOverviewRecent();
+  updateRegressionBanner();
 }
 
 function updateOverviewRoles() {
@@ -944,42 +1044,8 @@ function updateOverviewRecent() {
   `).join('');
 }
 
-// Быстрые действия Обзора
-async function runAllTests(btn) {
-  const keys = suitesRegistry.map(s => s.key);
-  if (!keys.length) {
-    toastError('Реестр сютов пуст — проверьте доступность бэкенда.');
-    return;
-  }
-
-  const anyRunning = Object.values(suiteStates).some(s => s.running);
-  if (anyRunning) {
-    const ok = await confirmDialog(
-      'Прогон уже выполняется',
-      'Запустить все тесты заново? Индикаторы текущего прогона будут перезаписаны.',
-      'Всё равно запустить'
-    );
-    if (!ok) return;
-  }
-
-  await busyWrap(btn, async () => {
-    try {
-      const res = await fetch('/api/runs', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ suites: keys }),
-      });
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      markSuitesRunning(keys);
-      toastSuccess(`Запущено сютов: ${keys.length}. Наблюдайте за прогрессом во вкладке «Тесты и чеклисты».`);
-      logTerminal('INFO', '[Обзор] Запущены все тесты (' + keys.length + ').');
-      switchTab('checklists');
-    } catch (err) {
-      keys.forEach(k => finalizeSuiteCard(k, false));
-      toastError('Ошибка запуска всех тестов: ' + err.message);
-    }
-  });
-}
+// Быстрые действия Обзора: запуск всех тестов заменён кнопкой
+// «Регресс после релиза» → openRegressionModal() / startRegression().
 
 function goToChecklists() {
   switchTab('checklists');
@@ -988,6 +1054,302 @@ function goToChecklists() {
 function newScenarioFromOverview() {
   switchTab('scenarios');
   newScenario();
+}
+
+// ==========================================
+// РЕГРЕСС ПОСЛЕ РЕЛИЗА
+// Батч-запуск всех (или выбранных) сютов как одной группы:
+// POST /api/runs {"suites":[...], "trigger":"regression"} → массив прогонов,
+// у каждого общий groupId. Если выбран не-активный стенд — сначала
+// последовательно активируем его (POST /api/stands/{id}/activate),
+// дожидаемся загрузки хранилища токенов и только потом запускаем.
+// ==========================================
+
+function isRegressionModalOpen() {
+  const m = document.getElementById('regressionModal');
+  return !!m && !m.classList.contains('hidden');
+}
+
+async function openRegressionModal(markAll) {
+  if (typeof loadStands === 'function') await loadStands(); // свежий кэш стендов для радио-списка
+  if (markAll) selectAllSuitesForBatch();
+  renderRegressionStands();
+  renderRegressionSuites();
+  updateRegressionCounter();
+  const modal = document.getElementById('regressionModal');
+  if (modal) modal.classList.remove('hidden');
+}
+
+// Кнопка «🚀 Регресс всех» на чеклистах: выделить все сюты + та же модалка
+function openRegressionAll() {
+  openRegressionModal(true);
+}
+
+function closeRegressionModal() {
+  const m = document.getElementById('regressionModal');
+  if (m) m.classList.add('hidden');
+}
+
+// Выделить все сюты «в батч» на карточках чеклистов
+function selectAllSuitesForBatch() {
+  suitesRegistry.forEach(s => {
+    if (suiteStates[s.key]) suiteStates[s.key].selected = true;
+  });
+  document.querySelectorAll('[data-suite-card]').forEach(card => {
+    const key = card.getAttribute('data-suite-card');
+    const cb = card.querySelector('input[type="checkbox"]');
+    if (cb && suiteStates[key]) cb.checked = true;
+  });
+  updateBatchBar();
+}
+
+// ---------- Модалка: стенды ----------
+
+// Радио-список стендов из standsCache; активный предвыбран («текущий»)
+function renderRegressionStands() {
+  const box = document.getElementById('regStandsList');
+  if (!box) return;
+
+  // standsCache объявлен через let в stands.js — на window его нет,
+  // обращаемся напрямую по глобальному лексическому имени.
+  const cache = (typeof standsCache !== 'undefined') ? (standsCache || []) : [];
+  if (!cache.length) {
+    box.innerHTML = '<div class="py-3 text-center text-slate-500 italic border border-dashed border-darkborder rounded-lg">Стенды не найдены — добавьте через «управлять стендами»</div>';
+    updateRegressionStandWarn();
+    return;
+  }
+
+  box.innerHTML = cache.map(s => {
+    const active = !!s.isActive;
+    const mockBadge = s.isMock
+      ? '<span class="text-[9px] font-bold px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/30 shrink-0">МОК</span>'
+      : '';
+    const currentBadge = active
+      ? '<span class="text-[9px] font-bold px-1.5 py-0.5 rounded border bg-green-500/15 text-green-400 border-green-500/30 shrink-0">текущий</span>'
+      : '';
+    return `
+      <label class="flex items-start gap-2.5 rounded-lg border px-3 py-2 cursor-pointer transition ${active ? 'border-green-500/60 bg-green-500/10 hover:border-green-400' : 'border-darkborder bg-slate-900/60 hover:border-slate-500'}">
+        <input type="radio" name="regStand" value="${escAttr(s.id)}" ${active ? 'checked' : ''} onchange="onRegressionStandChange()" class="mt-0.5 shrink-0 ${s.isMock ? 'accent-amber-500' : 'accent-fuchsia-500'}">
+        <span class="flex-1 min-w-0">
+          <span class="flex items-center gap-1.5 flex-wrap">
+            <span class="font-bold truncate ${active ? 'text-green-400' : 'text-white'}">${escapeHtml(s.name)}</span>
+            ${mockBadge}${currentBadge}
+          </span>
+          <span class="block font-mono text-[10px] text-slate-500 truncate">${escapeHtml(s.baseURL || '—')}</span>
+        </span>
+      </label>`;
+  }).join('');
+  updateRegressionStandWarn();
+}
+
+function onRegressionStandChange() {
+  updateRegressionStandWarn();
+}
+
+function selectedRegressionStandId() {
+  const el = document.querySelector('#regStandsList input[name="regStand"]:checked');
+  return el ? el.value : null;
+}
+
+// Предупреждение, если выбран НЕ-активный стенд (токены подтянутся из его хранилища)
+function updateRegressionStandWarn() {
+  const warn = document.getElementById('regStandWarn');
+  if (!warn) return;
+  const id = selectedRegressionStandId();
+  const stand = (id !== null && typeof findStandById === 'function') ? findStandById(id) : null;
+  warn.classList.toggle('hidden', !!(stand && stand.isActive));
+}
+
+// ---------- Модалка: сюты ----------
+
+// Чекбокс-список всех сютов реестра (включая кастомные), все отмечены по умолчанию
+function renderRegressionSuites() {
+  const box = document.getElementById('regSuitesList');
+  if (!box) return;
+
+  if (!suitesRegistry.length) {
+    box.innerHTML = '<div class="sm:col-span-2 py-3 text-center text-slate-500 italic border border-dashed border-darkborder rounded-lg">Реестр сютов пуст или недоступен — обновите вкладку «Тесты & Чеклисты»</div>';
+    return;
+  }
+
+  box.innerHTML = suitesRegistry.map(s => {
+    const cat = CATEGORY_STYLES[s.category] || CATEGORY_STYLES.flow;
+    return `
+      <label class="flex items-center gap-2 rounded-lg border border-darkborder bg-slate-900/60 hover:border-slate-500 px-2.5 py-1.5 cursor-pointer transition min-w-0">
+        <input type="checkbox" value="${escAttr(s.key)}" checked onchange="updateRegressionCounter()" class="rounded border-darkborder bg-slate-900 accent-fuchsia-500 shrink-0">
+        <span class="flex-1 min-w-0 truncate text-slate-200" title="${escAttr(s.title)}">${escapeHtml(s.title)}</span>
+        <span class="text-[9px] font-bold px-1.5 py-0.5 rounded border shrink-0 ${cat.badge}">${escapeHtml(cat.ru)}</span>
+      </label>`;
+  }).join('');
+}
+
+function regressionSelectedKeys() {
+  return Array.from(document.querySelectorAll('#regSuitesList input[type="checkbox"]:checked')).map(cb => cb.value);
+}
+
+function updateRegressionCounter() {
+  const n = regressionSelectedKeys().length;
+  const counter = document.getElementById('regSelCount');
+  if (counter) counter.textContent = 'Выбрано: ' + n;
+  const btn = document.getElementById('regStartBtn');
+  if (btn) btn.disabled = n === 0;
+}
+
+// ---------- Запуск регресса ----------
+
+async function startRegression(btn) {
+  const keys = regressionSelectedKeys();
+  if (!keys.length) {
+    toastError('Отметьте хотя бы один сьют.');
+    return;
+  }
+
+  const standId = selectedRegressionStandId();
+  const stand = (standId !== null && typeof findStandById === 'function') ? findStandById(standId) : null;
+  if (!stand) {
+    toastError('Выберите стенд для регресса.');
+    return;
+  }
+  const needActivate = !stand.isActive;
+
+  // Параллельные прогоны искажают результаты — предупреждаем
+  if (getActiveRunsCount() > 0) {
+    const ok = await confirmDialog(
+      'Идут другие прогоны',
+      'Параллельные прогоны могут исказить результаты. Запустить регресс?',
+      'Всё равно запустить'
+    );
+    if (!ok) return;
+  }
+
+  await busyWrap(btn, async () => {
+    try {
+      // Шаг 1: последовательно — активировать стенд и дождаться загрузки хранилища
+      if (needActivate) {
+        logTerminal('INFO', '[Регресс] Активация стенда «' + stand.name + '»…');
+        const actRes = await fetch('/api/stands/' + encodeURIComponent(stand.id) + '/activate', { method: 'POST' });
+        if (!actRes.ok) throw new Error('активация стенда: HTTP ' + actRes.status + ' ' + (await actRes.text()));
+        await Promise.all([
+          typeof loadStands === 'function' ? loadStands() : Promise.resolve(),
+          initStatus(),
+          loadVault(),
+        ]);
+        toastSuccess('Стенд «' + stand.name + '» активирован.');
+        logTerminal('SUCCESS', '[Регресс] Стенд «' + stand.name + '» активирован, токены загружены из его хранилища.');
+      }
+
+      // Шаг 2: батч-запуск с trigger=regression
+      const res = await fetch('/api/runs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ suites: keys, trigger: 'regression' }),
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text()));
+      const runs = await res.json();
+
+      // Шаг 3: запоминаем группу для плашки на Обзоре
+      activeRegressionGroupId = (Array.isArray(runs) && runs[0] && runs[0].groupId) ? runs[0].groupId : null;
+
+      // Ключи сютов берём из ответа бэкенда (на случай расхождений с реестром UI)
+      const respKeys = Array.isArray(runs)
+        ? runs.map(r => r && r.suiteKey).filter(Boolean)
+        : [];
+      markSuitesRunning(respKeys.length ? respKeys : keys);
+      closeRegressionModal();
+      toastSuccess('Регресс запущен: ' + keys.length + ' ' + pluralRu(keys.length, ['сют', 'сюта', 'сютов']) + '.');
+      logTerminal('SUCCESS', '[Регресс] Запущено сютов: ' + keys.length +
+        (activeRegressionGroupId ? ' (группа ' + String(activeRegressionGroupId).substring(0, 8) + ')' : '') + '.');
+
+      // Шаг 4: таб чеклистов — карточки оживут по SSE; история подтягивается для плашки
+      switchTab('checklists');
+      loadHistory();
+    } catch (err) {
+      logTerminal('ERROR', '[Регресс] Ошибка запуска: ' + err.message);
+      toastError('Не удалось запустить регресс: ' + err.message);
+    }
+  });
+}
+
+// Esc закрывает модалку регресса (но не поверх открытого confirmDialog)
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const modal = document.getElementById('regressionModal');
+  if (!modal || modal.classList.contains('hidden')) return;
+  const confirmBox = document.getElementById('confirmModal');
+  if (confirmBox && !confirmBox.classList.contains('hidden')) return;
+  closeRegressionModal();
+});
+
+// ==========================================
+// ИТОГОВАЯ ПЛАШКА РЕГРЕССА НА ОБЗОРЕ («Последние прогоны», сверху)
+// После каждого SUMMARY цепочка schedulePostSummaryRefresh → loadHistory →
+// updateOverviewFromCache приводит плашку в актуальное состояние: пока в группе
+// есть RUNNING — синий прогресс; когда завершились ВСЕ — зелёный/красный итог.
+// ==========================================
+
+function updateRegressionBanner() {
+  const box = document.getElementById('regressionBannerBox');
+  if (!box) return;
+
+  let gid = activeRegressionGroupId;
+  if (!gid) {
+    // После перезагрузки страницы подхватываем группу, где ещё идут прогоны
+    const runningReg = (historyCache || []).find(r =>
+      r && r.trigger === 'regression' && r.groupId && (!r.status || r.status === 'RUNNING'));
+    gid = runningReg ? runningReg.groupId : null;
+  }
+
+  const runs = gid
+    ? (historyCache || []).filter(r => r && r.trigger === 'regression' && String(r.groupId) === String(gid))
+    : [];
+  if (!runs.length) {
+    box.classList.add('hidden');
+    box.innerHTML = '';
+    return;
+  }
+
+  const total = runs.length;
+  const passed = runs.filter(r => r.status === 'PASSED').length;
+  const failed = runs.filter(r => r.status === 'FAILED').length;
+  const pending = total - passed - failed;
+  const finished = pending === 0;
+  const allOk = finished && failed === 0;
+
+  let cls, icon, title, detail;
+  if (finished) {
+    cls = allOk
+      ? 'border-green-500/40 bg-green-500/10 text-green-300'
+      : 'border-red-500/40 bg-red-500/10 text-red-300';
+    icon = allOk ? 'fa-circle-check text-green-400' : 'fa-circle-xmark text-red-400';
+    title = allOk ? 'Регресс пройден' : 'Регресс завершён с провалами';
+    detail = '✅ ' + passed + ' / ' + total + (failed ? ' · ❌ ' + failed : '');
+  } else {
+    cls = 'border-blue-500/40 bg-blue-500/10 text-blue-200';
+    icon = 'fa-solid fa-spinner fa-spin text-blue-400';
+    title = 'Регресс выполняется';
+    detail = 'готово ' + (passed + failed) + ' из ' + total +
+      (passed ? ' · ✅ ' + passed : '') + (failed ? ' · ❌ ' + failed : '') + ' · ⏳ ' + pending;
+  }
+
+  box.innerHTML =
+    '<div class="rounded-xl border ' + cls + ' px-4 py-3 flex items-center gap-3 flex-wrap">' +
+      '<i class="' + icon + ' shrink-0"></i>' +
+      '<span class="font-bold text-xs shrink-0">' + escapeHtml(title) + '</span>' +
+      '<span class="font-mono text-xs font-semibold shrink-0">Регресс: ' + escapeHtml(detail) + '</span>' +
+      '<button onclick="switchTab(\'checklists\')" class="ml-auto px-3 py-1.5 text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-200 border border-darkborder rounded-lg transition shrink-0">' +
+        '<i class="fa-solid fa-list-check mr-1"></i>К карточкам</button>' +
+    '</div>';
+  box.classList.remove('hidden');
+}
+
+// Возврат из «Управления стендами» в модалку регресса: список стендов мог
+// измениться (добавили/удалили/переключили) — перерисовываем радио-список.
+if (typeof closeStandsModal === 'function') {
+  const __baseCloseStandsModal = closeStandsModal;
+  window.closeStandsModal = function () {
+    __baseCloseStandsModal();
+    if (isRegressionModalOpen()) renderRegressionStands();
+  };
 }
 
 // ==========================================
@@ -1401,9 +1763,16 @@ async function loadHistory() {
 
       const runId = escAttr(r.id || '');
 
+      // Триггер запуска: регресс после релиза / webhook (задел на будущее)
+      const triggerBadge = r.trigger === 'regression'
+        ? '<span class="shrink-0 px-1.5 py-0.5 rounded text-[9px] font-bold bg-fuchsia-500/10 text-fuchsia-400 border border-fuchsia-500/30 whitespace-nowrap" title="Запущено как регресс после релиза">🚀 Регресс</span>'
+        : (r.trigger === 'webhook'
+            ? '<span class="shrink-0 px-1.5 py-0.5 rounded text-[9px] font-bold bg-cyan-500/10 text-cyan-300 border border-cyan-500/30 whitespace-nowrap" title="Запущено вебхуком">🔗 Webhook</span>'
+            : '');
+
       return `<tr onclick="openRunDetails('${runId}')" class="cursor-pointer hover:bg-slate-800/50 transition">
         <td class="p-3 font-mono text-[11px] text-slate-400" title="${runId}">${runId.substring(0, 8)}...</td>
-        <td class="p-3 font-semibold text-white">${escapeHtml(humanSuiteTitle(r.suiteKey, r.suiteName))}</td>
+        <td class="p-3 font-semibold text-white"><span class="flex items-center gap-1.5 min-w-0"><span class="truncate">${escapeHtml(humanSuiteTitle(r.suiteKey, r.suiteName))}</span>${triggerBadge}</span></td>
         <td class="p-3 font-mono text-[11px] text-cyan-400">${escapeHtml(r.suiteKey || '—')}</td>
         <td class="p-3">${statusBadge}</td>
         <td class="p-3 font-mono">${checksCell}</td>
@@ -1453,6 +1822,41 @@ function closeRunDetails() {
 
 function openLogsForDetailsRun() {
   openLogsFiltered(currentRunDetailsId);
+}
+
+async function downloadReport(id, fmt) {
+  const runId = id || currentRunDetailsId;
+  if (!runId) {
+    toastError('Прогон не выбран — сначала откройте отчёт по прогону.');
+    return;
+  }
+  const format = fmt === 'allure' ? 'allure' : 'junit';
+  try {
+    const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/export/${format}`);
+    if (!res.ok) {
+      toastError(`Не удалось скачать отчёт (HTTP ${res.status}).`);
+      return;
+    }
+    const blob = await res.blob();
+    const cd = res.headers.get('Content-Disposition') || '';
+    const m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+    const fallback = `e2e-${format}-${runId.substring(0, 8)}.${format === 'allure' ? 'zip' : 'xml'}`;
+    let filename = fallback;
+    if (m && m[1]) {
+      try { filename = decodeURIComponent(m[1].trim()); } catch (e) { filename = m[1].trim(); }
+    }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    toastInfo('Отчёт скачивается…');
+  } catch (err) {
+    toastError('Ошибка скачивания отчёта: ' + err.message);
+  }
 }
 
 function getCheckTitle(suiteKey, checkId) {
@@ -1532,6 +1936,12 @@ function tlDotIcon(status) {
 function renderRunDetails(run) {
   const title = document.getElementById('runDetailsTitle');
   title.innerHTML = `<i class="fa-solid fa-magnifying-glass-chart text-blue-400"></i><span>Отчёт: ${escapeHtml(humanSuiteTitle(run.suiteKey, run.suiteName || run.id))}</span>`;
+
+  const exportJunitBtn = document.getElementById('runExportJunitBtn');
+  const exportAllureBtn = document.getElementById('runExportAllureBtn');
+  const exportRunId = escAttr(run.id || '');
+  if (exportJunitBtn) exportJunitBtn.setAttribute('onclick', `downloadReport('${exportRunId}','junit')`);
+  if (exportAllureBtn) exportAllureBtn.setAttribute('onclick', `downloadReport('${exportRunId}','allure')`);
 
   // --- Шапка ---
   const statusBanner = run.status === 'PASSED'

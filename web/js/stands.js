@@ -2,20 +2,20 @@
 // stands.js — управление стендами: быстрый дропдаун в шапке,
 // модалка «Управление стендами», CRUD через /api/stands.
 // Контракт бэкенда:
-//   GET    /api/stands               → {"stands":[{id,name,baseURL,verifyCode,isMock,isActive}]}
-//   POST   /api/stands               → {name,baseURL,verifyCode?} → объект стенда | 400
+//   GET    /api/stands               → {"stands":[{id,name,baseURL,isMock,isActive}]}
+//   POST   /api/stands               → {name,baseURL} → объект стенда | 400
 //   PUT    /api/stands/{id}          → обновление (мок-стенду baseURL менять нельзя)
 //   DELETE /api/stands/{id}          → 409 с текстом, если активный или мок
 //   POST   /api/stands/{id}/activate → {"status":"ok","stand":{...}} — переключает весь движок
+// Поле verifyCode осталось в API для совместимости, но UI его больше
+// не показывает: код клиента вводится вручную во время прогона
+// (модалка inputCodeModal в app.js по SSE-событию INPUT_REQUIRED).
 // Загружается после ui.js и ДО app.js (глобальное пространство имён).
 // ============================================================
 
 // ---------- State ----------
 
 let standsCache = [];
-
-// Секреты verifyCode держим в JS-карте и никогда не кладём в HTML-атрибуты
-const standSecrets = new Map();
 
 function getActiveStand() {
   return standsCache.find(s => s && s.isActive) || null;
@@ -181,7 +181,6 @@ function closeStandsModal() {
 function renderStandsCards() {
   const grid = document.getElementById('standsGrid');
   if (!grid) return;
-  standSecrets.clear();
 
   if (!standsCache.length) {
     grid.innerHTML = '<div class="md:col-span-2 py-6 text-center text-xs text-slate-500 italic border border-dashed border-darkborder rounded-xl">Нет ни одного стенда. Добавьте первый в форме ниже.</div>';
@@ -190,21 +189,11 @@ function renderStandsCards() {
 
   grid.innerHTML = standsCache.map(s => {
     const active = !!s.isActive;
-    const code = s.verifyCode || '';
-    if (code) standSecrets.set(String(s.id), code);
 
     const badges = [
       active ? '<span class="text-[9px] font-bold px-1.5 py-0.5 rounded border bg-green-500/15 text-green-400 border-green-500/30 shrink-0">АКТИВЕН</span>' : '',
       s.isMock ? '<span class="text-[9px] font-bold px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/30 shrink-0">МОК</span>' : '',
     ].join('');
-
-    const codeHtml = code
-      ? `<span class="inline-flex items-center gap-1.5 bg-slate-950 border border-darkborder rounded px-2 py-0.5">
-           <span id="standCodeVal-${escAttr(s.id)}" class="select-none">••••</span>
-           <button onclick="toggleStandCode('${escAttr(s.id)}')" title="Показать/скрыть код верификации"
-             class="text-slate-500 hover:text-slate-200 transition"><i class="fa-regular fa-eye text-[10px]"></i></button>
-         </span>`
-      : '<span class="italic">не задан</span>';
 
     const undeletable = active || s.isMock;
     const deleteTitle = s.isMock ? 'Мок-стенд удалить нельзя' : (active ? 'Активный стенд удалить нельзя' : 'Удалить стенд');
@@ -217,9 +206,6 @@ function renderStandsCards() {
           ${badges}
         </div>
         <div class="font-mono text-[11px] break-all ${active ? 'text-emerald-400' : 'text-slate-400'}" title="Base URL стенда">${escapeHtml(s.baseURL || '—')}</div>
-        <div class="text-[10px] text-slate-500 flex items-center gap-1.5 flex-wrap">
-          <span class="uppercase tracking-wider font-bold shrink-0">Код верификации:</span> ${codeHtml}
-        </div>
         <div class="mt-auto pt-2 border-t border-darkborder flex items-center gap-1.5 flex-wrap">
           <button onclick="activateStand('${escAttr(s.id)}', this)" ${active ? 'disabled' : ''} title="${active ? 'Стенд уже активен' : 'Переключить движок на этот стенд'}"
             class="px-2.5 py-1.5 text-[11px] font-semibold rounded-lg transition flex items-center gap-1.5 ${active ? 'bg-green-500/10 text-green-400 border border-green-500/30 cursor-default disabled:opacity-60' : 'bg-green-600 hover:bg-green-500 text-white shadow-lg shadow-green-600/20'}">
@@ -238,30 +224,7 @@ function renderStandsCards() {
   }).join('');
 }
 
-// Глаз у карточки: показ/скрытие verifyCode из JS-карты секретов
-function toggleStandCode(id) {
-  const el = document.getElementById('standCodeVal-' + id);
-  if (!el) return;
-  const shown = el.dataset.shown === '1';
-  if (shown) {
-    el.textContent = '••••';
-    el.dataset.shown = '';
-  } else {
-    el.textContent = standSecrets.get(String(id)) || '';
-    el.dataset.shown = '1';
-  }
-  const icon = el.parentElement ? el.parentElement.querySelector('button i') : null;
-  if (icon) icon.className = shown ? 'fa-regular fa-eye text-[10px]' : 'fa-regular fa-eye-slash text-[10px]';
-}
-
 // ---------- Форма добавления/редактирования ----------
-
-function resetStandCodeVisibility() {
-  const input = document.getElementById('standVerifyCode');
-  const icon = document.getElementById('standVerifyCodeEyeIcon');
-  if (input) input.type = 'password';
-  if (icon) icon.className = 'fa-regular fa-eye';
-}
 
 function resetStandForm() {
   document.getElementById('standEditId').value = '';
@@ -271,8 +234,6 @@ function resetStandForm() {
   urlInput.value = '';
   urlInput.disabled = false;
   document.getElementById('standBaseUrlHint').classList.add('hidden');
-  document.getElementById('standVerifyCode').value = '';
-  resetStandCodeVisibility();
   document.getElementById('standSubmitLabel').textContent = 'Добавить стенд';
   document.getElementById('standCancelEditBtn').classList.add('hidden');
 }
@@ -293,9 +254,6 @@ function startEditStand(id) {
   urlInput.disabled = !!s.isMock; // мок-стенду baseURL менять нельзя
   document.getElementById('standBaseUrlHint').classList.toggle('hidden', !s.isMock);
 
-  document.getElementById('standVerifyCode').value = s.verifyCode || '';
-  resetStandCodeVisibility();
-
   document.getElementById('standSubmitLabel').textContent = 'Сохранить изменения';
   document.getElementById('standCancelEditBtn').classList.remove('hidden');
 
@@ -307,20 +265,10 @@ function startEditStand(id) {
   }
 }
 
-function toggleStandFormCodeVisibility() {
-  const input = document.getElementById('standVerifyCode');
-  const icon = document.getElementById('standVerifyCodeEyeIcon');
-  if (!input || !icon) return;
-  const show = input.type === 'password';
-  input.type = show ? 'text' : 'password';
-  icon.className = show ? 'fa-regular fa-eye-slash' : 'fa-regular fa-eye';
-}
-
 async function submitStandForm(btn) {
   const editId = document.getElementById('standEditId').value.trim();
   const name = document.getElementById('standName').value.trim();
   const baseURL = document.getElementById('standBaseUrl').value.trim();
-  const verifyCode = document.getElementById('standVerifyCode').value.trim();
 
   if (!name) {
     toastError('Укажите название стенда.');
@@ -335,7 +283,6 @@ async function submitStandForm(btn) {
   const editing = editId ? findStandById(editId) : null;
   const payload = { name };
   if (!(editing && editing.isMock)) payload.baseURL = baseURL;
-  if (verifyCode) payload.verifyCode = verifyCode;
 
   await busyWrap(btn, async () => {
     try {

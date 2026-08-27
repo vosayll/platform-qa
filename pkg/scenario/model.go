@@ -10,9 +10,10 @@ import (
 )
 
 var (
-	keyRe    = regexp.MustCompile(`^[a-z][a-z0-9_]{2,39}$`)
-	stepIDRe = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
-	classRe  = regexp.MustCompile(`^[2-5]xx$`)
+	keyRe       = regexp.MustCompile(`^[a-z][a-z0-9_]{2,39}$`)
+	stepIDRe    = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+	classRe     = regexp.MustCompile(`^[2-5]xx$`)
+	negClassRe  = regexp.MustCompile(`^![2-5]xx$`)
 
 	allowedRoles   = map[string]bool{"client": true, "rest": true, "courier": true, "admin": true, "none": true, "": true}
 	allowedTypes   = map[string]bool{"http": true, "delay": true, "assert": true}
@@ -39,7 +40,7 @@ type Step struct {
 	Body         json.RawMessage   `json:"body,omitempty"`
 	Headers      map[string]string `json:"headers,omitempty"`
 	Extract      map[string]string `json:"extract,omitempty"` // varName -> JSONPath
-	ExpectStatus interface{}       `json:"expectStatus,omitempty"` // float64 (int) or "2xx"/"4xx"/"5xx"; empty => any <400
+	ExpectStatus interface{}       `json:"expectStatus,omitempty"` // float64 (int) or "2xx"/"4xx"/"5xx"/"!4xx"/"!5xx"; empty => any <400
 	Asserts      []Assert          `json:"asserts,omitempty"`
 	MS           int               `json:"ms,omitempty"`    // delay duration in ms
 	Check        *Assert           `json:"check,omitempty"` // type=assert: left={{var}}, op: notEmpty|eq|neq|contains
@@ -150,10 +151,10 @@ func validateExpectStatus(v interface{}) error {
 		}
 		return nil
 	case string:
-		if classRe.MatchString(t) {
+		if classRe.MatchString(t) || negClassRe.MatchString(t) {
 			return nil
 		}
-		return fmt.Errorf("строковый статус должен быть классом вида \"2xx\"/\"4xx\"/\"5xx\", получено %q", t)
+		return fmt.Errorf("строковый статус должен быть классом вида \"2xx\"/\"4xx\"/\"5xx\" или отрицанием \"!4xx\"/\"!5xx\", получено %q", t)
 	default:
 		return fmt.Errorf("ожидается число 100..599 или строка класса ответа, получен тип %T", v)
 	}

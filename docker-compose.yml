@@ -18,7 +18,7 @@ services:
       - REST_TOKEN=${REST_TOKEN:-}
       - COURIER_TOKEN=${COURIER_TOKEN:-}
       - ADMIN_TOKEN=${ADMIN_TOKEN:-}
-      - VERIFICATION_CODE=${VERIFICATION_CODE:-1234}
+      - VERIFICATION_CODE=${VERIFICATION_CODE:-}
       - DATA_DIR=/app/data
     volumes:
       - e2e-data:/app/data
