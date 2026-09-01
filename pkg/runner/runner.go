@@ -581,6 +581,10 @@ func (o *TestOrchestrator) executeSuite(run *TestRun, suiteKey string) {
 		err = o.runSecurityRBAC(ctx, run, suiteKey)
 	case "idempotency":
 		err = o.runIdempotency(ctx, run, suiteKey)
+	case "courier_reassignment":
+		err = o.runCourierReassignment(ctx, run, suiteKey)
+	case "input_validation":
+		err = o.runInputValidation(ctx, run, suiteKey)
 	case "all":
 		err = o.runFlowA(ctx, run, "flow_a")
 		if err == nil {
@@ -597,6 +601,12 @@ func (o *TestOrchestrator) executeSuite(run *TestRun, suiteKey string) {
 		}
 		if err == nil {
 			err = o.runIdempotency(ctx, run, "idempotency")
+		}
+		if err == nil {
+			err = o.runCourierReassignment(ctx, run, "courier_reassignment")
+		}
+		if err == nil {
+			err = o.runInputValidation(ctx, run, "input_validation")
 		}
 	default:
 		if o.hasCustom(suiteKey) {
@@ -1595,6 +1605,238 @@ func (o *TestOrchestrator) runIdempotency(ctx context.Context, run *TestRun, sui
 		Timestamp: time.Now(),
 	})
 	o.checkDone(run, suiteKey, "concurrent_isolation", true, fmt.Sprintf("%d параллельных созданий вернули %d уникальных независимых OrderID без пересечений сессий", parallelCount, len(uniqueIDs)), concStart)
+
+	return nil
+}
+
+func (o *TestOrchestrator) runCourierReassignment(ctx context.Context, run *TestRun, suiteKey string) error {
+	suiteName := "Edge Case: Courier Reassignment"
+	o.Emit(&ExecutionEvent{
+		RunID:     run.ID,
+		SuiteName: suiteName,
+		SuiteKey:  suiteKey,
+		StepType:  "SUITE_START",
+		Level:     LogInfo,
+		Message:   "Verifying that an order can be reassigned from one courier to another...",
+		Timestamp: time.Now(),
+	})
+
+	// 1. Setup Identities
+	setupStart := time.Now()
+	o.checkStart(run, suiteKey, "setup")
+
+	clientPhone, clientToken, err := o.engine.Fixtures.CreateUniqueClient(ctx)
+	if err != nil {
+		o.checkDone(run, suiteKey, "setup", false, fmt.Sprintf("fixture client failed: %v", err), setupStart)
+		return fmt.Errorf("fixture client failed: %w", err)
+	}
+	o.engine.SessionMgr.SetClientSession("c_reassign", clientToken, clientPhone, "Client")
+
+	courier1Phone, _, err := o.engine.Fixtures.CreateUniqueCourier(ctx)
+	if err != nil {
+		o.checkDone(run, suiteKey, "setup", false, fmt.Sprintf("fixture courier 1 failed: %v", err), setupStart)
+		return fmt.Errorf("fixture courier 1 failed: %w", err)
+	}
+	courier2Phone, _, err := o.engine.Fixtures.CreateUniqueCourier(ctx)
+	if err != nil {
+		o.checkDone(run, suiteKey, "setup", false, fmt.Sprintf("fixture courier 2 failed: %v", err), setupStart)
+		return fmt.Errorf("fixture courier 2 failed: %w", err)
+	}
+
+	if o.engine.Config.AdminToken == "" {
+		if _, err = o.engine.SessionMgr.LoginAdmin(ctx, o.engine.Config.AdminLogin, o.engine.Config.AdminPassword); err != nil {
+			o.checkDone(run, suiteKey, "setup", false, fmt.Sprintf("admin login failed: %v", err), setupStart)
+			return fmt.Errorf("admin login failed: %w", err)
+		}
+	}
+
+	o.checkDone(run, suiteKey, "setup", true, "Уникальные фикстуры созданы: клиент, 2 курьера", setupStart)
+
+	// 2. Create order and dispatch to Courier 1
+	assignStart := time.Now()
+	o.checkStart(run, suiteKey, "assign_courier_1")
+
+	order, err := o.engine.ClientAPI.CreateRestaurantOrder(ctx, client.CreateRestaurantOrderRequest{
+		RestID:          "rest_reassign_test",
+		DeliveryAddress: "Москва, Смоленская 5",
+		PaymentType:     "card",
+	})
+	if err != nil {
+		o.checkDone(run, suiteKey, "assign_courier_1", false, fmt.Sprintf("create order failed: %v", err), assignStart)
+		return fmt.Errorf("create order failed: %w", err)
+	}
+
+	order, err = o.engine.AdminAPI.AssignCourier(ctx, order.OrderID, courier1Phone)
+	if err != nil {
+		o.checkDone(run, suiteKey, "assign_courier_1", false, fmt.Sprintf("admin assign courier 1 failed: %v", err), assignStart)
+		return fmt.Errorf("admin assign courier 1 failed: %w", err)
+	}
+	if order.CourierID != courier1Phone {
+		msg := fmt.Sprintf("order must be assigned to courier 1 (%s), got %s", courier1Phone, order.CourierID)
+		o.checkDone(run, suiteKey, "assign_courier_1", false, msg, assignStart)
+		return fmt.Errorf("%s", msg)
+	}
+
+	o.Emit(&ExecutionEvent{
+		RunID:     run.ID,
+		SuiteName: suiteName,
+		SuiteKey:  suiteKey,
+		StepType:  "THEN",
+		Level:     LogSuccess,
+		Message:   fmt.Sprintf("✓ Order #%d initially assigned to Courier 1: %s", order.OrderNumber, courier1Phone),
+		OrderID:   order.OrderID,
+		Timestamp: time.Now(),
+	})
+	o.checkDone(run, suiteKey, "assign_courier_1", true, fmt.Sprintf("Заказ назначен на курьера №1: %s", courier1Phone), assignStart)
+
+	// 3. Reassign to Courier 2
+	reassignStart := time.Now()
+	o.checkStart(run, suiteKey, "reassign_courier_2")
+
+	order, err = o.engine.AdminAPI.AssignCourier(ctx, order.OrderID, courier2Phone)
+	if err != nil {
+		o.checkDone(run, suiteKey, "reassign_courier_2", false, fmt.Sprintf("admin reassign courier failed: %v", err), reassignStart)
+		return fmt.Errorf("admin reassign courier failed: %w", err)
+	}
+	if order.CourierID != courier2Phone {
+		msg := fmt.Sprintf("order must be reassigned to courier 2 (%s), got %s", courier2Phone, order.CourierID)
+		o.checkDone(run, suiteKey, "reassign_courier_2", false, msg, reassignStart)
+		return fmt.Errorf("%s", msg)
+	}
+
+	o.Emit(&ExecutionEvent{
+		RunID:     run.ID,
+		SuiteName: suiteName,
+		SuiteKey:  suiteKey,
+		StepType:  "THEN",
+		Level:     LogSuccess,
+		Message:   fmt.Sprintf("✓ Order #%d successfully reassigned to Courier 2: %s", order.OrderNumber, courier2Phone),
+		OrderID:   order.OrderID,
+		Timestamp: time.Now(),
+	})
+	o.checkDone(run, suiteKey, "reassign_courier_2", true, fmt.Sprintf("Заказ переназначен на курьера №2: %s", courier2Phone), reassignStart)
+
+	return nil
+}
+
+func (o *TestOrchestrator) runInputValidation(ctx context.Context, run *TestRun, suiteKey string) error {
+	suiteName := "Negative: Input Validation & Boundary Conditions"
+	o.Emit(&ExecutionEvent{
+		RunID:     run.ID,
+		SuiteName: suiteName,
+		SuiteKey:  suiteKey,
+		StepType:  "SUITE_START",
+		Level:     LogInfo,
+		Message:   "Verifying rejection of malformed input across registration and order creation...",
+		Timestamp: time.Now(),
+	})
+
+	// 1. Non-Russian phone format on registration
+	phoneStart := time.Now()
+	o.checkStart(run, suiteKey, "reject_invalid_phone")
+
+	regErr := o.engine.ClientAPI.Register(ctx, client.ClientRegisterRequest{PhoneNumber: "+12025550199"})
+	if regErr == nil {
+		msg := "expected 400 for non-Russian phone format, registration succeeded"
+		o.checkDone(run, suiteKey, "reject_invalid_phone", false, msg, phoneStart)
+		return fmt.Errorf("%s", msg)
+	}
+	if !strings.Contains(regErr.Error(), "400") {
+		msg := fmt.Sprintf("expected 400 for non-Russian phone format, got: %v", regErr)
+		o.checkDone(run, suiteKey, "reject_invalid_phone", false, msg, phoneStart)
+		return fmt.Errorf("%s", msg)
+	}
+	o.Emit(&ExecutionEvent{
+		RunID: run.ID, SuiteName: suiteName, SuiteKey: suiteKey, StepType: "THEN", Level: LogSuccess,
+		Message: fmt.Sprintf("✓ Correctly rejected non-RU phone format: %v", regErr), Timestamp: time.Now(),
+	})
+	o.checkDone(run, suiteKey, "reject_invalid_phone", true, "Нероссийский формат телефона отклонён (400)", phoneStart)
+
+	// 2. Empty verification code on login
+	codeStart := time.Now()
+	o.checkStart(run, suiteKey, "reject_empty_verification_code")
+
+	_, loginErr := o.engine.ClientAPI.Login(ctx, client.ClientLoginRequest{PhoneNumber: "+79991234567", VerificationCode: ""})
+	if loginErr == nil {
+		msg := "expected 400 for empty verification code, login succeeded"
+		o.checkDone(run, suiteKey, "reject_empty_verification_code", false, msg, codeStart)
+		return fmt.Errorf("%s", msg)
+	}
+	if !strings.Contains(loginErr.Error(), "400") {
+		msg := fmt.Sprintf("expected 400 for empty verification code, got: %v", loginErr)
+		o.checkDone(run, suiteKey, "reject_empty_verification_code", false, msg, codeStart)
+		return fmt.Errorf("%s", msg)
+	}
+	o.Emit(&ExecutionEvent{
+		RunID: run.ID, SuiteName: suiteName, SuiteKey: suiteKey, StepType: "THEN", Level: LogSuccess,
+		Message: fmt.Sprintf("✓ Correctly rejected login without verification code: %v", loginErr), Timestamp: time.Now(),
+	})
+	o.checkDone(run, suiteKey, "reject_empty_verification_code", true, "Вход с пустым кодом верификации отклонён (400)", codeStart)
+
+	// 3. Negative price on independent order
+	priceStart := time.Now()
+	o.checkStart(run, suiteKey, "reject_negative_price")
+
+	_, negClientToken, err := o.engine.Fixtures.CreateUniqueClient(ctx)
+	if err != nil {
+		msg := fmt.Sprintf("fixture client failed: %v", err)
+		o.checkDone(run, suiteKey, "reject_negative_price", false, msg, priceStart)
+		return fmt.Errorf("%s", msg)
+	}
+	o.engine.SessionMgr.SetClientSession("c_neg", negClientToken, "+79991234567", "Client")
+
+	_, priceErr := o.engine.ClientAPI.CreateIndependentOrder(ctx, client.CreateIndependentOrderRequest{
+		AddressA: "Точка А",
+		AddressB: "Точка Б",
+		Price:    -500,
+	})
+	if priceErr == nil {
+		msg := "expected 400 for negative price, order was created"
+		o.checkDone(run, suiteKey, "reject_negative_price", false, msg, priceStart)
+		return fmt.Errorf("%s", msg)
+	}
+	if !strings.Contains(priceErr.Error(), "400") {
+		msg := fmt.Sprintf("expected 400 for negative price, got: %v", priceErr)
+		o.checkDone(run, suiteKey, "reject_negative_price", false, msg, priceStart)
+		return fmt.Errorf("%s", msg)
+	}
+	o.Emit(&ExecutionEvent{
+		RunID: run.ID, SuiteName: suiteName, SuiteKey: suiteKey, StepType: "THEN", Level: LogSuccess,
+		Message: fmt.Sprintf("✓ Correctly rejected order with negative price: %v", priceErr), Timestamp: time.Now(),
+	})
+	o.checkDone(run, suiteKey, "reject_negative_price", true, "Заказ-посылка с отрицательной ценой отклонён (400)", priceStart)
+
+	// 4. Missing delivery address on restaurant order
+	addrStart := time.Now()
+	o.checkStart(run, suiteKey, "reject_missing_address")
+
+	_, addrClientToken, err := o.engine.Fixtures.CreateUniqueClient(ctx)
+	if err != nil {
+		msg := fmt.Sprintf("fixture client failed: %v", err)
+		o.checkDone(run, suiteKey, "reject_missing_address", false, msg, addrStart)
+		return fmt.Errorf("%s", msg)
+	}
+	o.engine.SessionMgr.SetClientSession("c_addr", addrClientToken, "+79991234567", "Client")
+
+	_, addrErr := o.engine.ClientAPI.CreateRestaurantOrder(ctx, client.CreateRestaurantOrderRequest{
+		RestID:          "rest_123",
+		DeliveryAddress: "",
+	})
+	if addrErr == nil {
+		msg := "expected 400 for missing delivery address, order was created"
+		o.checkDone(run, suiteKey, "reject_missing_address", false, msg, addrStart)
+		return fmt.Errorf("%s", msg)
+	}
+	if !strings.Contains(addrErr.Error(), "400") {
+		msg := fmt.Sprintf("expected 400 for missing delivery address, got: %v", addrErr)
+		o.checkDone(run, suiteKey, "reject_missing_address", false, msg, addrStart)
+		return fmt.Errorf("%s", msg)
+	}
+	o.Emit(&ExecutionEvent{
+		RunID: run.ID, SuiteName: suiteName, SuiteKey: suiteKey, StepType: "THEN", Level: LogSuccess,
+		Message: fmt.Sprintf("✓ Correctly rejected order without delivery address: %v", addrErr), Timestamp: time.Now(),
+	})
+	o.checkDone(run, suiteKey, "reject_missing_address", true, "Заказ без адреса доставки отклонён (400)", addrStart)
 
 	return nil
 }

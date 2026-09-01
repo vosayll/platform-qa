@@ -94,10 +94,36 @@ var suites = []Suite{
 			{ID: "unauthorized_role_restaurant", Title: "Ресторан не может назначать курьера"},
 		},
 	},
+	{
+		Key:         "courier_reassignment",
+		Title:       "Переназначение курьера на заказе",
+		Description: "Заказ, уже назначенный на одного курьера, корректно переназначается администратором на другого.",
+		Category:    "edge",
+		Tags:        []string{"courier", "reassignment"},
+		Checks: []CheckItem{
+			{ID: "setup", Title: "Генерация уникальных фикстур: клиент, 2 курьера"},
+			{ID: "assign_courier_1", Title: "Админ назначает заказ на курьера №1"},
+			{ID: "reassign_courier_2", Title: "Админ переназначает заказ на курьера №2"},
+		},
+	},
+	{
+		Key:         "input_validation",
+		Title:       "Валидация входных данных и граничные условия",
+		Description: "Отклонение некорректных данных на входе: формат телефона, код верификации, отрицательная цена, отсутствующий адрес.",
+		Category:    "negative",
+		Tags:        []string{"validation", "boundary"},
+		Checks: []CheckItem{
+			{ID: "reject_invalid_phone", Title: "Отклонён нероссийский формат телефона при регистрации"},
+			{ID: "reject_empty_verification_code", Title: "Отклонён вход с пустым кодом верификации"},
+			{ID: "reject_negative_price", Title: "Отклонён заказ-посылка с отрицательной ценой"},
+			{ID: "reject_missing_address", Title: "Отклонён заказ без адреса доставки"},
+		},
+	},
 }
 
 // All returns a copy of the full suite catalog in canonical order:
-// flow_a, flow_b, cancellation, idempotency, security_rbac, negative_sm.
+// flow_a, flow_b, cancellation, idempotency, security_rbac, negative_sm,
+// courier_reassignment, input_validation.
 func All() []Suite {
 	out := make([]Suite, len(suites))
 	copy(out, suites)
